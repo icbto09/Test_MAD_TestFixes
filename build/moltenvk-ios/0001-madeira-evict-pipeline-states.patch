@@ -1,0 +1,153 @@
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+index e385e9b..03092d5 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.h
+@@ -32,6 +32,7 @@
+ #include <unordered_map>
+ #include <unordered_set>
+ #include <ostream>
++#include <mutex>
+ 
+ #import <Metal/Metal.h>
+ 
+@@ -253,12 +254,17 @@ public:
+ 	/** Returns the number of output tessellation patch control points. */
+ 	uint32_t getOutputControlPointCount() { return _outputControlPointCount; }
+ 
+-	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+-	id<MTLRenderPipelineState> getMainPipelineState() const { return _mtlPipelineState; }
++	/**
++	 * Returns the MTLRenderPipelineState for the final stage of the pipeline.
++	 * Madeira: when pipeline eviction is on (MADEIRA_MVK_EVICT_PIPELINES=1), an ordinary
++	 * pipeline's Metal state is released right after it is first compiled, and rebuilt
++	 * here, from the retained descriptor, the first time a draw needs it.
++	 */
++	id<MTLRenderPipelineState> getMainPipelineState() const;
+ 
+ 	/** Returns the MTLRenderPipelineState for the final stage of the pipeline */
+ 	id<MTLRenderPipelineState> getMultiviewPipelineState(uint32_t mv) const {
+-		return _multiviewMTLPipelineStates.empty() ? _mtlPipelineState : _multiviewMTLPipelineStates.find(mv)->second;
++		return _multiviewMTLPipelineStates.empty() ? getMainPipelineState() : _multiviewMTLPipelineStates.find(mv)->second;
+ 	}
+ 
+ 	/** Returns the MTLComputePipelineState object for the vertex stage of a tessellated draw with no indices. */
+@@ -394,6 +400,12 @@ protected:
+ 	id<MTLComputePipelineState> _mtlTessControlStageState = nil;
+ 	id<MTLRenderPipelineState> _mtlPipelineState = nil;
+ 
++	// Madeira pipeline eviction (see getMainPipelineState()).
++	MTLRenderPipelineDescriptor* _evictedMTLPipelineDesc = nil;	// retained while evicted
++	mutable std::mutex _evictedMTLPipelineLock;
++	mutable bool _evictedRebuildFailed = false;
++	bool _isEvictedPipeline = false;
++
+ 	MVKShaderImplicitRezBinding _reservedVertexAttributeBufferCount;
+ 	VkPrimitiveTopology _vkPrimitiveTopology;
+ 	uint32_t _outputControlPointCount;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+index 7eae64c..b37dffb 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKPipeline.mm
+@@ -27,6 +27,10 @@
+ #include "mvk_datatypes.hpp"
+ #include <sys/stat.h>
+ #include <sstream>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ 
+ #ifndef MVK_USE_CEREAL
+ #define MVK_USE_CEREAL (1)
+@@ -44,6 +48,31 @@ using namespace mvk;
+ using namespace SPIRV_CROSS_NAMESPACE;
+ 
+ 
++#pragma mark - Madeira pipeline eviction
++
++// Opt-in with the environment variable MADEIRA_MVK_EVICT_PIPELINES=1 (any value except "0").
++// Games such as Detroit: Become Human create every graphics pipeline up front and keep
++// them all alive. Each one holds a compiled MTLRenderPipelineState, so memory grows with
++// every pipeline created and never comes back. With eviction on, an ordinary graphics
++// pipeline (no tessellation, no multiview) is still fully compiled at creation, which
++// validates it and warms Metal's shader cache, but the compiled state is released at once
++// and only the descriptor is kept. The state is rebuilt the first time a draw needs it.
++static bool mvkMadeiraEvictPipelines() {
++	static const bool isEnabled = [] {
++		const char* val = getenv("MADEIRA_MVK_EVICT_PIPELINES");
++		bool enabled = val && *val && strcmp(val, "0") != 0;
++		fprintf(stderr, "[mvk-madeira] pipeline eviction %s (MADEIRA_MVK_EVICT_PIPELINES=%s)\n",
++				enabled ? "ON" : "off", val ? val : "unset");
++		return enabled;
++	}();
++	return isEnabled;
++}
++
++static std::atomic<uint64_t> sMadeiraEvictedCount(0);
++static std::atomic<uint64_t> sMadeiraRebuiltCount(0);
++static std::atomic<uint64_t> sMadeiraRebuildFailedCount(0);
++
++
+ #pragma mark - MVKPipelineLayout
+ 
+ bool MVKPipelineLayout::stageUsesPushConstants(MVKShaderStage stage) const {
+@@ -1006,6 +1035,32 @@ id<MTLRenderPipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLRenderPi
+ 	return plState;
+ }
+ 
++// Madeira pipeline eviction: rebuilds an evicted pipeline state on first use.
++// Called from command encoding, possibly on several threads at once, so the rebuild is locked.
++id<MTLRenderPipelineState> MVKGraphicsPipeline::getMainPipelineState() const {
++	if ( !_isEvictedPipeline ) { return _mtlPipelineState; }
++
++	std::lock_guard<std::mutex> lock(_evictedMTLPipelineLock);
++	if ( !_mtlPipelineState && _evictedMTLPipelineDesc && !_evictedRebuildFailed ) {
++		MVKGraphicsPipeline* mutableThis = const_cast<MVKGraphicsPipeline*>(this);
++		mutableThis->getOrCompilePipeline(_evictedMTLPipelineDesc, mutableThis->_mtlPipelineState);
++		if (_mtlPipelineState) {
++			uint64_t n = ++sMadeiraRebuiltCount;
++			if (n == 1 || n % 250 == 0) {
++				fprintf(stderr, "[mvk-madeira] rebuilt %llu pipelines on use (evicted %llu)\n",
++						(unsigned long long)n, (unsigned long long)sMadeiraEvictedCount.load());
++			}
++		} else {
++			// Don't retry on every draw; the draw is skipped, as for any pipeline that failed to compile.
++			_evictedRebuildFailed = true;
++			uint64_t n = ++sMadeiraRebuildFailedCount;
++			fprintf(stderr, "[mvk-madeira] rebuild failed for an evicted pipeline (%llu failures so far)\n",
++					(unsigned long long)n);
++		}
++	}
++	return _mtlPipelineState;
++}
++
+ // Either returns an existing pipeline state or compiles a new one.
+ id<MTLComputePipelineState> MVKGraphicsPipeline::getOrCompilePipeline(MTLComputePipelineDescriptor* plDesc,
+ 																	  id<MTLComputePipelineState>& plState,
+@@ -1127,6 +1182,18 @@ void MVKGraphicsPipeline::initMTLRenderPipelineState(const VkGraphicsPipelineCre
+ 				}
+ 			} else {
+ 				getOrCompilePipeline(plDesc, _mtlPipelineState);
++				// Madeira: keep only the recipe; rebuild in getMainPipelineState() on first use.
++				if (_mtlPipelineState && mvkMadeiraEvictPipelines()) {
++					_evictedMTLPipelineDesc = [plDesc retain];		// released in destructor
++					[_mtlPipelineState release];
++					_mtlPipelineState = nil;
++					_isEvictedPipeline = true;
++					uint64_t n = ++sMadeiraEvictedCount;
++					if (n == 1 || n % 1000 == 0) {
++						fprintf(stderr, "[mvk-madeira] evicted %llu pipelines, rebuilt %llu on use\n",
++								(unsigned long long)n, (unsigned long long)sMadeiraRebuiltCount.load());
++					}
++				}
+ 			}
+ 			[plDesc release];																				// temp release
+ 		} else {
+@@ -2398,6 +2465,7 @@ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
+ 		[_mtlTessVertexStageIndex32State release];
+ 		[_mtlTessControlStageState release];
+ 		[_mtlPipelineState release];
++		[_evictedMTLPipelineDesc release];
+ 		if (_ownsVertexModule) delete _vertexModule;
+ 		if (_ownsTessCtlModule) delete _tessCtlModule;
+ 		if (_ownsTessEvalModule) delete _tessEvalModule;

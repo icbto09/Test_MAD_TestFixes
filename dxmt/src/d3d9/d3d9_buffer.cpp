@@ -1,0 +1,874 @@
+#include "d3d9_buffer.hpp"
+#include "d3d9_guest_alloc.hpp"
+
+#include "d3d9_device.hpp"
+#include "d3d9_private_data.hpp"
+#include "d3d9_resource_priority.hpp"
+#include "log/log.hpp"
+#include "wsi_platform.hpp"
+
+#include "d3d9_census.hpp"
+#include "util_env.hpp"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+
+namespace dxmt {
+
+namespace {
+
+// Refresh-time rename shared by the vertex and index buffers: recycle a
+// GPU-idle allocation (or mint one) and install it as the current
+// name. Metal returns a null buffer on video-memory exhaustion, and a placed
+// allocation keeps a non-null CPU pointer even then, so the plain immediate-
+// memory null check downstream would not catch it. Reject the fresh
+// allocation here, leaving the current name intact, so a null-backed name is
+// never installed (a later draw would bind a null MTLBuffer) and Lock reports
+// the failure instead of handing back a pointer into a dead allocation.
+//
+// coherent_seq must mean the GPU has completed through that seq, which is what
+// m_completionEvent reports and what the upload rings already recycle their
+// host blocks on. The refresh overwrites the recycled allocation with the CPU,
+// so a reader draw that is encoded but not yet retired would be torn.
+HRESULT
+renameDynamicBuffer(MTLD3D9Device *device, DynamicBuffer *dynamic, uint64_t current_seq, uint64_t coherent_seq) {
+  bool minted_fresh = false;
+  auto fresh = dynamic->allocate(coherent_seq, &minted_fresh);
+  if (!fresh.ptr() || !fresh->buffer())
+    return D3DERR_OUTOFVIDEOMEMORY;
+  // Only a mint adds to the footprint the next commit has to relieve; a recycle
+  // reuses memory already accounted for.
+  if (minted_fresh)
+    device->noteDynamicRenameBytes(fresh->length());
+  dynamic->updateImmediateName(current_seq, std::move(fresh), 0, false);
+  return D3D_OK;
+}
+
+// Direct mapping (d3d9_buffer_map.hpp): a 64-bit guest can address Metal's own
+// allocation, so both premises of the mirror are gone for it. The native ARM64
+// frontend also builds without __i386__ but serves 32-bit guests
+// (DXMT_MADEIRA), so it keeps the mirror. MADEIRA_D3D9_DIRECT_MAP=0 keeps the
+// mirror here too. Read once.
+bool
+directMapEnabled() {
+#if defined(__x86_64__) && !defined(DXMT_MADEIRA)
+  static const bool enabled = env::getEnvVar("MADEIRA_D3D9_DIRECT_MAP") != "0";
+  return enabled;
+#else
+  return false;
+#endif
+}
+
+// DEFAULT + DYNAMIC is the pool and usage whose locks carry DISCARD and
+// NOOVERWRITE, which is what makes handing out the read allocation safe; a
+// software-VP-only device strips both (sanitize_buffer_lock_flags).
+bool
+wantsDirectMap(MTLD3D9Device *device, D3DPOOL pool, DWORD usage) {
+  return directMapEnabled() && pool == D3DPOOL_DEFAULT && (usage & D3DUSAGE_DYNAMIC) && !device->canOnlySWVP();
+}
+
+// MTLD3D9IndexBuffer::refreshRange: an indexed draw stores only the index bytes
+// it reads. MADEIRA_D3D9_INDEX_RANGE=0 keeps the whole-buffer refresh before
+// every draw. Read once.
+bool
+indexRangeEnabled() {
+  static const bool enabled = env::getEnvVar("MADEIRA_D3D9_INDEX_RANGE") != "0";
+  return enabled;
+}
+
+// What refreshRange saved, logged now and then so a session log shows it.
+// Calling thread under the device lock; a second device only mixes its counts in.
+struct IndexRangeStats {
+  uint64_t stores = 0, stored = 0, whole = 0, renames = 0;
+};
+
+void
+noteIndexRangeStore(IndexRangeStats &stats, uint64_t stored, uint64_t whole) {
+  ++stats.stores;
+  stats.stored += stored;
+  stats.whole += whole;
+  if (stats.stores != 1 && stats.stores != 4096 && (stats.stores & ((1u << 18) - 1)) != 0)
+    return;
+  Logger::info(
+      "[d3d9-index-range] " + std::to_string(stats.stores) + " index stores, " + std::to_string(stats.stored >> 10) +
+      " KB stored where the whole-buffer refresh would have stored " + std::to_string(stats.whole >> 10) + " KB, " +
+      std::to_string(stats.renames) + " renames (MADEIRA_D3D9_INDEX_RANGE=0 restores the whole-buffer refresh)"
+  );
+}
+
+IndexRangeStats g_indexRangeStats;
+
+// A direct-mapped buffer's allocations keep the default CPU cache mode rather
+// than write-combined: the application may read what it locked, and
+// ProcessVertices and the strip and fan index scans read it too
+// (hostPointer), where the mirror used to serve those reads from cached
+// memory. Replaces the create-time write-combined allocation, which nothing
+// has used yet, and returns the flags the DynamicBuffer mints with.
+Flags<BufferAllocationFlag>
+useCachedAllocation(dxmt::Buffer *buffer) {
+  auto cached = buffer->allocate(Flags<BufferAllocationFlag>(), "d3d9 direct-mapped buffer");
+  if (cached.ptr() && cached->buffer().handle != 0 && cached->mappedMemory(0))
+    buffer->rename(std::move(cached));
+  return Flags<BufferAllocationFlag>();
+}
+
+// Lock of a direct-mapped buffer. DISCARD takes a GPU-idle allocation and
+// leaves the old one to the draws already recorded against it. NOOVERWRITE
+// keeps the current one: the application promises not to touch what those
+// draws read, as on Windows. A plain lock must neither wait nor hand back
+// memory a queued draw reads, so it renames too and carries the contents over.
+// The sequence numbers are renameDynamicBuffer's.
+HRESULT
+lockDirect(
+    MTLD3D9Device *device, DynamicBuffer *dynamic, UINT size, DWORD flags, uint64_t current_seq,
+    uint64_t coherent_seq, void **out
+) {
+  if (!(flags & D3DLOCK_NOOVERWRITE)) {
+    const bool keep = !(flags & D3DLOCK_DISCARD);
+    Rc<BufferAllocation> old = dynamic->immediateName();
+    const void *old_ptr = dynamic->immediateMappedMemory();
+    HRESULT hr = renameDynamicBuffer(device, dynamic, current_seq, coherent_seq);
+    if (FAILED(hr))
+      return hr;
+    if (keep && old_ptr && dynamic->immediateMappedMemory())
+      std::memcpy(dynamic->immediateMappedMemory(), old_ptr, size);
+  }
+  *out = dynamic->immediateMappedMemory();
+  return *out ? D3D_OK : D3DERR_INVALIDCALL;
+}
+
+} // namespace
+
+MTLD3D9VertexBuffer::MTLD3D9VertexBuffer(
+    MTLD3D9Device *device, UINT size, DWORD usage, DWORD fvf, D3DPOOL pool, void *host_ptr, Rc<dxmt::Buffer> dxmt_buffer
+) :
+    m_device(device),
+    m_dxmtBuffer(std::move(dxmt_buffer)),
+    m_hostPtr(host_ptr),
+    m_size(size),
+    m_usage(usage),
+    m_fvf(fvf),
+    m_pool(pool) {
+  // Wrap the underlying Buffer in the DynamicBuffer recycling wrapper (the same
+  // one d3d11 uses, d3d11_buffer.cpp). m_dxmtBuffer anchors the Buffer
+  // whose raw pointer the wrapper holds; the wrapper's initial name is the
+  // Buffer's current() allocation set at create time. That allocation is
+  // CPU-writable, so a refresh stores the mirror into it without a staging
+  // block (d3d11 dynamic buffers use the same class), but it is Metal-owned and
+  // never handed out: nothing the application touches is ever the allocation a
+  // draw reads (d3d9_buffer_map.hpp). A Lock(DISCARD) recycles a GPU-idle one.
+  // Every generation must carry this class, including the create-time one, or a
+  // store into an allocation that cannot be written is silently dropped.
+  const bool direct = wantsDirectMap(device, pool, usage);
+  m_dynamic = new dxmt::DynamicBuffer(
+      m_dxmtBuffer.ptr(),
+      direct ? useCachedAllocation(m_dxmtBuffer.ptr()) : Flags<BufferAllocationFlag>(BufferAllocationFlag::CpuWriteCombined)
+  );
+  // Direct mapping also needs a CPU address this process can use. A
+  // direct-mapped buffer has no mirror: free it rather than carry an unused
+  // copy of every dynamic buffer.
+  m_direct = direct && m_dynamic->immediateMappedMemory() != nullptr;
+  if (m_direct && m_hostPtr) {
+    guest_free(m_hostPtr);
+    m_hostPtr = nullptr;
+  }
+  // A non-DEFAULT buffer is dirty over its whole extent from creation so its
+  // first bind or Unlock uploads the mirror; DEFAULT contents are undefined
+  // until the app writes them (DXVK d3d9_common_buffer.cpp).
+  if (m_pool != D3DPOOL_DEFAULT)
+    m_dirty = true;
+  // Self-pin: same shape as MTLD3D9Surface / MTLD3D9Texture. The
+  // override Release path drops the device pin after ComObject::
+  // Release has decremented public to 0; the self-pin keeps `this`
+  // alive across that window.
+  AddRefPrivate();
+}
+
+MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer() {
+  // Every allocation the DynamicBuffer owns (the current name plus the FIFO
+  // of retired ones) is completion-pinned by the ref tracker: a draw that
+  // binds this buffer registers an access<> read against the frozen
+  // allocation and pins the wrapper through the chunk's resolved pins
+  // (BatchedDraw::resolved_vb_pins) until the GPU retires that chunk. So the
+  // dtor runs only once no in-flight cmdbuf still reads them. m_dynamic
+  // (declared after m_dxmtBuffer) destructs first and drops those
+  // allocations; each BufferAllocation frees its own private backing. The
+  // host mirror was never registered with Metal and the GPU never reads it,
+  // so free it directly.
+  if (m_hostPtr)
+    guest_free(m_hostPtr);
+  if (m_isLosable)
+    m_device->onLosableResourceDestroyed(m_size);
+}
+
+void
+MTLD3D9VertexBuffer::refreshWholeMirror() {
+  // A direct-mapped buffer is never dirty: draws read what the application wrote.
+  if (!m_dirty || m_direct)
+    return;
+  // Rename before storing. An earlier draw in this chunk may already be
+  // recorded against the current allocation, and overwriting it in place would
+  // hand that draw contents it was never recorded with. A fresh allocation
+  // leaves the old one intact for as long as those draws pin it, and the FIFO
+  // recycles it once the GPU has provably passed them. This is the Metal
+  // dynamic-data idiom.
+  //
+  // The whole mirror goes, not a tracked span: the application does not
+  // truthfully report what it wrote, and may still be writing.
+  //
+  // The cost this accepts, stated because every reference avoids it: a lock
+  // held across several draws pays a rename and a whole-mirror copy per draw,
+  // where wined3d reuses the client address with no upload for a coherent BO
+  // and DXVK's direct NOOVERWRITE path copies nothing. They can, because their
+  // lock pointer aliases the memory the draw reads; ours cannot alias it, so
+  // the mirror has to be carried across. Honouring the locked range instead
+  // was measured and refused: 36.6% of NOOVERWRITE refreshes write OUTSIDE the
+  // range the application declared.
+  if (FAILED(renameDynamicBuffer(
+          m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+          m_device->m_cachedSignaled.load(std::memory_order_acquire)
+      ))) {
+    // madeira-bcd (GTA IV, JA13M8): no room for a new generation. Wait for the
+    // GPU to finish what is recorded (MTLD3D9Device::drainForDynamicRename) and
+    // try again: a released generation is recycled, and with none to recycle the
+    // store goes into the current generation, which no unfinished draw reads now.
+    // A refresh with room never comes here. Calling thread under the device lock,
+    // between draws (BuildDrawCapture), where a state change drains the batch too.
+    if (m_device->drainForDynamicRename()) {
+      if (FAILED(renameDynamicBuffer(
+              m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+              m_device->m_cachedSignaled.load(std::memory_order_acquire)
+          )))
+        m_device->noteRenameInPlace();
+    } else {
+      // Video memory is exhausted, so the cache keeps the previous generation and
+      // the draw reads one refresh of stale geometry. Say so once: the failure is
+      // otherwise invisible, and stale vertices look like a rendering bug rather
+      // than an allocation one. Calling thread under the device lock.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+      }
+      return;
+    }
+  }
+  // The name installed above is GPU-idle by construction, so it takes the
+  // mirror directly, the same shape d3d11's dynamic Unmap uses
+  // (d3d11_context_imm.cpp). Charged to the staging axis: this is the whole
+  // calling-thread cost of bringing the cache up to date, and the frontend
+  // total is only meaningful while every such copy lands on one of its terms.
+  // Where the allocation has no address this process can reach, the write
+  // crosses to the unix side instead of being a local memcpy, so the cost
+  // tracks refresh COUNT as much as bytes.
+  {
+    m_dynamic->immediateName()->updateContents(0, m_hostPtr, m_size, m_dynamic->immediateSuballocation());
+  }
+  // Still mapped means the application can write more before the next draw
+  // without telling us, so the cache cannot be declared current yet.
+  m_dirty = m_writeLocked;
+}
+
+void
+MTLD3D9VertexBuffer::markLosable() {
+  if (!m_isLosable) {
+    m_isLosable = true;
+    m_device->onLosableResourceCreated(m_size);
+  }
+}
+
+ULONG STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::AddRef() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_AddRef);
+  ULONG ref = ComObject::AddRef();
+  if (ref == 1)
+    m_device->AddRef();
+  return ref;
+}
+
+ULONG STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::Release() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_Release);
+  // D3D9 Release-at-0 clamp: handed out at public 0 while self-pinned / bound,
+  // so guard the underflow before the decrement (DXVK clamps every device
+  // child; same shape as the surface/swapchain/texture clamps).
+  if (m_refCount.load() == 0)
+    return 0;
+  ULONG ref = ComObject::Release();
+  if (ref == 0) {
+    // Losable counter: decrement on pub->0, BEFORE m_device->Release
+    // can destruct the device. See MTLD3D9Surface::Release for the
+    // full rationale: Reset's counter check fires while bound
+    // resources still have device priv refs, so the counter must
+    // track app-pub-ref presence, not full destruct.
+    if (m_isLosable) {
+      m_isLosable = false;
+      m_device->onLosableResourceDestroyed(m_size);
+    }
+    // The destructor releases the DynamicBuffer's Metal allocations (whose
+    // dispose calls into the device's Metal device), so the device has to
+    // outlive it. Drop the device pin LAST: capture it (ReleasePrivate frees
+    // `this`), let the destructor run while the pin still keeps the device
+    // alive, then release the pin, which may now free it.
+    MTLD3D9Device *device = m_device;
+    // Drop the ctor self-pin exactly once: same shape as
+    // MTLD3D9Surface / MTLD3D9Texture. Subsequent Get/Release cycles
+    // on a slot-bound buffer must not call ReleasePrivate again
+    // (m_vertexBuffers[N] holds its own priv ref).
+    if (m_self_pinned) {
+      m_self_pinned = false;
+      ReleasePrivate();
+    }
+    device->Release();
+  }
+  return ref;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::QueryInterface(REFIID riid, void **ppvObject) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_QueryInterface);
+  if (!ppvObject)
+    return E_POINTER;
+  *ppvObject = nullptr;
+
+  if (riid == __uuidof(IUnknown) || riid == __uuidof(IDirect3DResource9) || riid == __uuidof(IDirect3DVertexBuffer9)) {
+    *ppvObject = static_cast<IDirect3DVertexBuffer9 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::GetDevice(IDirect3DDevice9 **ppDevice) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_GetDevice);
+  D9DeviceLock lock = m_device->LockDevice();
+  if (!ppDevice)
+    return D3DERR_INVALIDCALL;
+  *ppDevice = ::dxmt::ref(static_cast<IDirect3DDevice9 *>(m_device));
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::SetPrivateData(REFGUID refguid, const void *pData, DWORD SizeOfData, DWORD Flags) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_SetPrivateData);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9SetPrivateData(m_privateData, refguid, pData, SizeOfData, Flags);
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::GetPrivateData(REFGUID refguid, void *pData, DWORD *pSizeOfData) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_GetPrivateData);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9GetPrivateData(m_privateData, refguid, pData, pSizeOfData);
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::FreePrivateData(REFGUID refguid) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_FreePrivateData);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9FreePrivateData(m_privateData, refguid);
+}
+
+DWORD STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::SetPriority(DWORD PriorityNew) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_SetPriority);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9SetResourcePriority(m_pool, m_priority, PriorityNew);
+}
+
+DWORD STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::GetPriority() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_GetPriority);
+  D9DeviceLock lock = m_device->LockDevice();
+  return m_priority;
+}
+
+void STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::PreLoad() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_PreLoad);
+  D9DeviceLock lock = m_device->LockDevice();
+  // Apple Silicon's unified memory makes residency hints a no-op.
+}
+
+D3DRESOURCETYPE STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::GetType() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_GetType);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3DRTYPE_VERTEXBUFFER;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_Lock);
+  census::lockBytes(SizeToLock);
+  D9DeviceLock lock = m_device->LockDevice();
+  if (!ppbData)
+    return D3DERR_INVALIDCALL;
+  *ppbData = nullptr;
+  // Flag sanitisation (d3d9_buffer_map.hpp): drop the flags this
+  // pool/usage does not honour before any of them take effect. No bounds
+  // validation: the runtime neither clamps nor rejects OffsetToLock /
+  // SizeToLock, the returned pointer is simply base + offset.
+  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
+  // The lock pointer is the host mirror, disjoint from the GPU-read
+  // allocation, so a Lock never waits and never returns WASSTILLDRAWING.
+  // DISCARD therefore needs nothing done here. Its purpose is to let a driver
+  // hand back fresh storage rather than stall, and neither half applies: the
+  // application never touches the allocation, and the refresh that carries the
+  // mirror across renames unconditionally, so a name installed here would be
+  // retired by that rename without a single draw ever reading it. That is the
+  // mirror; a direct-mapped buffer hands out the allocation instead.
+  if (m_direct) {
+    void *base = nullptr;
+    HRESULT hr = lockDirect(
+        m_device, m_dynamic.ptr(), m_size, Flags, m_device->m_currentCmdSeq,
+        m_device->m_cachedSignaled.load(std::memory_order_acquire), &base
+    );
+    if (FAILED(hr))
+      return hr;
+    m_lockCount.increment();
+    *ppbData = static_cast<char *>(base) + OffsetToLock;
+    return D3D_OK;
+  }
+  if (!m_hostPtr)
+    return D3DERR_INVALIDCALL;
+  // A write lock stales the cache and nothing finer is recorded: the
+  // application does not truthfully report which bytes it wrote, and may still
+  // be writing after Unlock (d3d9_buffer_map.hpp).
+  if (buffer_lock_updates_dirty(Flags)) {
+    m_dirty = true;
+    m_writeLocked = true;
+  }
+  m_lockCount.increment();
+  *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::Unlock() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_Unlock);
+  D9DeviceLock lock = m_device->LockDevice();
+  // Nothing uploads here, for any pool. The draw that reads the buffer
+  // refreshes it, because an application may still be writing through the
+  // pointer it was handed: a lock is advisory about its extent and about its
+  // lifetime both, so anything finalised at Unlock can already be stale.
+  if (m_lockCount.decrement() == 0)
+    m_writeLocked = false;
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9VertexBuffer::GetDesc(D3DVERTEXBUFFER_DESC *pDesc) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9VertexBuffer_GetDesc);
+  D9DeviceLock lock = m_device->LockDevice();
+  if (!pDesc)
+    return D3DERR_INVALIDCALL;
+  pDesc->Format = D3DFMT_VERTEXDATA;
+  pDesc->Type = D3DRTYPE_VERTEXBUFFER;
+  pDesc->Usage = m_usage;
+  pDesc->Pool = m_pool;
+  pDesc->Size = m_size;
+  pDesc->FVF = m_fvf;
+  return D3D_OK;
+}
+
+// ============================================================
+// MTLD3D9IndexBuffer
+// ============================================================
+
+MTLD3D9IndexBuffer::MTLD3D9IndexBuffer(
+    MTLD3D9Device *device, UINT size, DWORD usage, D3DFORMAT format, D3DPOOL pool, void *host_ptr,
+    Rc<dxmt::Buffer> dxmt_buffer
+) :
+    m_device(device),
+    m_dxmtBuffer(std::move(dxmt_buffer)),
+    m_hostPtr(host_ptr),
+    m_size(size),
+    m_usage(usage),
+    m_format(format),
+    m_pool(pool) {
+  // See MTLD3D9VertexBuffer's ctor: wrap the underlying Buffer in the
+  // DynamicBuffer recycling wrapper over a CPU-writable, Metal-owned
+  // allocation.
+  const bool direct = wantsDirectMap(device, pool, usage);
+  m_dynamic = new dxmt::DynamicBuffer(
+      m_dxmtBuffer.ptr(),
+      direct ? useCachedAllocation(m_dxmtBuffer.ptr()) : Flags<BufferAllocationFlag>(BufferAllocationFlag::CpuWriteCombined)
+  );
+  // See MTLD3D9VertexBuffer's ctor: a direct-mapped buffer has no mirror.
+  m_direct = direct && m_dynamic->immediateMappedMemory() != nullptr;
+  if (m_direct && m_hostPtr) {
+    guest_free(m_hostPtr);
+    m_hostPtr = nullptr;
+  }
+  // See MTLD3D9VertexBuffer's ctor: a non-DEFAULT buffer starts wholly dirty.
+  if (m_pool != D3DPOOL_DEFAULT)
+    m_dirty = true;
+  AddRefPrivate();
+}
+
+MTLD3D9IndexBuffer::~MTLD3D9IndexBuffer() {
+  // See MTLD3D9VertexBuffer::~MTLD3D9VertexBuffer: same shape. The
+  // DynamicBuffer allocations release via m_dynamic (before m_dxmtBuffer);
+  // only the host mirror is freed here.
+  if (m_hostPtr)
+    guest_free(m_hostPtr);
+  if (m_isLosable)
+    m_device->onLosableResourceDestroyed(m_size);
+}
+
+void
+MTLD3D9IndexBuffer::refreshWholeMirror() {
+  if (!m_dirty || m_direct)
+    return;
+  // See MTLD3D9VertexBuffer::refreshWholeMirror: rename first, then the whole
+  // mirror rather than a span the application described.
+  if (FAILED(renameDynamicBuffer(
+          m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+          m_device->m_cachedSignaled.load(std::memory_order_acquire)
+      ))) {
+    // madeira-bcd (GTA IV, JA13M8): no room for a new generation. Wait for the
+    // GPU to finish what is recorded (MTLD3D9Device::drainForDynamicRename) and
+    // try again: a released generation is recycled, and with none to recycle the
+    // store goes into the current generation, which no unfinished draw reads now.
+    // A refresh with room never comes here. Calling thread under the device lock,
+    // between draws (BuildDrawCapture), where a state change drains the batch too.
+    if (m_device->drainForDynamicRename()) {
+      if (FAILED(renameDynamicBuffer(
+              m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+              m_device->m_cachedSignaled.load(std::memory_order_acquire)
+          )))
+        m_device->noteRenameInPlace();
+    } else {
+      // Video memory is exhausted, so the cache keeps the previous generation and
+      // the draw reads one refresh of stale geometry. Say so once: the failure is
+      // otherwise invisible, and stale vertices look like a rendering bug rather
+      // than an allocation one. Calling thread under the device lock.
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+      }
+      return;
+    }
+  }
+  // See MTLD3D9VertexBuffer::refreshWholeMirror for why the store goes straight
+  // into the fresh name and why it is charged to the staging axis.
+  {
+    m_dynamic->immediateName()->updateContents(0, m_hostPtr, m_size, m_dynamic->immediateSuballocation());
+  }
+  // Still mapped means the application can write more before the next draw
+  // without telling us, so the cache cannot be declared current yet.
+  m_dirty = m_writeLocked;
+}
+
+bool
+MTLD3D9IndexBuffer::renameBeforeStore() {
+  // refreshWholeMirror's rename and its madeira-bcd out-of-memory fallback, the
+  // same steps in the same order: wait for the GPU and try again, and with
+  // nothing to recycle store into the current generation, which no unfinished
+  // draw reads once the GPU is idle.
+  if (SUCCEEDED(renameDynamicBuffer(
+          m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+          m_device->m_cachedSignaled.load(std::memory_order_acquire)
+      )))
+    return true;
+  if (m_device->drainForDynamicRename()) {
+    if (FAILED(renameDynamicBuffer(
+            m_device, m_dynamic.ptr(), m_device->m_currentCmdSeq,
+            m_device->m_cachedSignaled.load(std::memory_order_acquire)
+        )))
+      m_device->noteRenameInPlace();
+    return true;
+  }
+  static bool warned = false;
+  if (!warned) {
+    warned = true;
+    Logger::warn("d3d9: out of video memory refreshing a dynamic buffer; the draw reads stale contents");
+  }
+  return false;
+}
+
+// refreshWholeMirror stores the whole mirror before every draw that follows a
+// write lock, and before every draw while a lock is held. An engine that keeps
+// one large index buffer mapped while it draws from it, or locks a little of it
+// before each draw, then copies the whole buffer per draw: a Call of Duty
+// engine's render thread spent nearly all its time in that copy (memmove under
+// refreshWholeMirror) on an A19 Pro, at 12-20 fps with the GPU 22% busy.
+//
+// An indexed draw reads exactly its StartIndex .. StartIndex + count indices,
+// so only those bytes have to be current when it is recorded. What keeps this
+// as safe as the whole-buffer refresh:
+// - The range comes from the draw, never from the window a lock announced, so
+//   a write past a lock's window still reaches the draw that reads it.
+// - A write lock makes every byte of the current allocation suspect (Lock), so
+//   each later draw stores its own range from the mirror again, and while a
+//   lock is held every draw does: the application may write at any time.
+// - A store goes into the allocation earlier draws were recorded against only
+//   while every write lock since that allocation was installed carried
+//   NOOVERWRITE. The application then promises not to change the bytes those
+//   draws read, so the store rewrites them with the values they already hold,
+//   which is what a draw on Windows reads from a directly mapped buffer. After
+//   any other write lock (plain or DISCARD) the store renames first, and for as
+//   long as such a lock is held every store does, so the recorded draws keep
+//   the contents they were recorded with.
+// - The bytes known to be current are one interval, grown together with the
+//   gap to a new range when the gap is no larger than that range, so between
+//   two write locks no byte is stored twice and a draw whose range is current
+//   stores nothing.
+void
+MTLD3D9IndexBuffer::refreshRange(UINT begin, UINT end) {
+  if (!indexRangeEnabled()) {
+    refreshWholeMirror();
+    return;
+  }
+  if (!m_dirty || m_direct || !m_hostPtr)
+    return;
+  end = std::min(end, m_size);
+  if (begin >= end)
+    return;
+  if (!m_writeLocked && begin >= m_currentBegin && end <= m_currentEnd)
+    return;
+  if (m_renameDue) {
+    if (!renameBeforeStore())
+      return;
+    ++g_indexRangeStats.renames;
+    // While a lock without NOOVERWRITE is held, the application may still
+    // change the bytes this draw reads, so the next store renames again: each
+    // draw keeps its own copy, as with refreshWholeMirror.
+    m_renameDue = m_renameEachStore;
+    m_currentBegin = m_currentEnd = 0;
+  }
+  // The bytes to store: the new range, plus the gap to the current interval
+  // when that keeps it one piece, minus what is current already.
+  UINT lo = begin, hi = end;
+  bool grow = m_currentBegin < m_currentEnd && !m_writeLocked;
+  if (grow) {
+    const UINT gap = begin > m_currentEnd ? begin - m_currentEnd : (m_currentBegin > end ? m_currentBegin - end : 0);
+    grow = gap <= end - begin;
+  }
+  const uint32_t sub = m_dynamic->immediateSuballocation();
+  const char *mirror = static_cast<const char *>(m_hostPtr);
+  uint64_t stored = 0;
+  if (grow) {
+    lo = std::min(begin, m_currentBegin);
+    hi = std::max(end, m_currentEnd);
+    if (lo < m_currentBegin) {
+      m_dynamic->immediateName()->updateContents(lo, mirror + lo, m_currentBegin - lo, sub);
+      stored += m_currentBegin - lo;
+    }
+    if (hi > m_currentEnd) {
+      m_dynamic->immediateName()->updateContents(m_currentEnd, mirror + m_currentEnd, hi - m_currentEnd, sub);
+      stored += hi - m_currentEnd;
+    }
+  } else {
+    m_dynamic->immediateName()->updateContents(begin, mirror + begin, end - begin, sub);
+    stored = end - begin;
+  }
+  noteIndexRangeStore(g_indexRangeStats, stored, m_size);
+  // Still mapped: nothing is current past this draw (see m_writeLocked). Else
+  // keep the larger of the two intervals when they did not join.
+  if (m_writeLocked)
+    return;
+  if (grow || hi - lo >= m_currentEnd - m_currentBegin) {
+    m_currentBegin = lo;
+    m_currentEnd = hi;
+  }
+  if (m_currentBegin == 0 && m_currentEnd == m_size)
+    m_dirty = false;
+}
+
+void
+MTLD3D9IndexBuffer::markLosable() {
+  if (!m_isLosable) {
+    m_isLosable = true;
+    m_device->onLosableResourceCreated(m_size);
+  }
+}
+
+ULONG STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::AddRef() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_AddRef);
+  ULONG ref = ComObject::AddRef();
+  if (ref == 1)
+    m_device->AddRef();
+  return ref;
+}
+
+ULONG STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::Release() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_Release);
+  // D3D9 Release-at-0 clamp (see MTLD3D9VertexBuffer::Release).
+  if (m_refCount.load() == 0)
+    return 0;
+  ULONG ref = ComObject::Release();
+  if (ref == 0) {
+    if (m_isLosable) {
+      m_isLosable = false;
+      m_device->onLosableResourceDestroyed(m_size);
+    }
+    // The destructor releases the DynamicBuffer's Metal allocations, so the
+    // device has to outlive it (see MTLD3D9VertexBuffer::Release): drop the
+    // device pin last, after the destructor has run.
+    MTLD3D9Device *device = m_device;
+    if (m_self_pinned) {
+      m_self_pinned = false;
+      ReleasePrivate();
+    }
+    device->Release();
+  }
+  return ref;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::QueryInterface(REFIID riid, void **ppvObject) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_QueryInterface);
+  if (!ppvObject)
+    return E_POINTER;
+  *ppvObject = nullptr;
+
+  if (riid == __uuidof(IUnknown) || riid == __uuidof(IDirect3DResource9) || riid == __uuidof(IDirect3DIndexBuffer9)) {
+    *ppvObject = static_cast<IDirect3DIndexBuffer9 *>(this);
+    AddRef();
+    return S_OK;
+  }
+  return E_NOINTERFACE;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::GetDevice(IDirect3DDevice9 **ppDevice) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_GetDevice);
+  D9DeviceLock lock = m_device->LockDevice();
+  if (!ppDevice)
+    return D3DERR_INVALIDCALL;
+  *ppDevice = ::dxmt::ref(static_cast<IDirect3DDevice9 *>(m_device));
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::SetPrivateData(REFGUID refguid, const void *pData, DWORD SizeOfData, DWORD Flags) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_SetPrivateData);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9SetPrivateData(m_privateData, refguid, pData, SizeOfData, Flags);
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::GetPrivateData(REFGUID refguid, void *pData, DWORD *pSizeOfData) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_GetPrivateData);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9GetPrivateData(m_privateData, refguid, pData, pSizeOfData);
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::FreePrivateData(REFGUID refguid) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_FreePrivateData);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9FreePrivateData(m_privateData, refguid);
+}
+
+DWORD STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::SetPriority(DWORD PriorityNew) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_SetPriority);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3D9SetResourcePriority(m_pool, m_priority, PriorityNew);
+}
+
+DWORD STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::GetPriority() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_GetPriority);
+  D9DeviceLock lock = m_device->LockDevice();
+  return m_priority;
+}
+
+void STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::PreLoad() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_PreLoad);
+  D9DeviceLock lock = m_device->LockDevice();
+  // Apple Silicon's unified memory makes residency hints a no-op.
+}
+
+D3DRESOURCETYPE STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::GetType() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_GetType);
+  D9DeviceLock lock = m_device->LockDevice();
+  return D3DRTYPE_INDEXBUFFER;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::Lock(UINT OffsetToLock, UINT SizeToLock, void **ppbData, DWORD Flags) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_Lock);
+  census::lockBytes(SizeToLock);
+  D9DeviceLock lock = m_device->LockDevice();
+  // Same shape as MTLD3D9VertexBuffer::Lock: see the rationale there
+  // for the flag sanitisation, DISCARD / NOOVERWRITE semantics, the
+  // plain-map GPU sync, and the mode-aware lockable base.
+  if (!ppbData)
+    return D3DERR_INVALIDCALL;
+  *ppbData = nullptr;
+  Flags = sanitize_buffer_lock_flags(Flags, m_pool, m_usage, m_device->canOnlySWVP());
+  // See MTLD3D9VertexBuffer::Lock for why DISCARD needs nothing done here, and
+  // for the direct-mapped case.
+  if (m_direct) {
+    void *base = nullptr;
+    HRESULT hr = lockDirect(
+        m_device, m_dynamic.ptr(), m_size, Flags, m_device->m_currentCmdSeq,
+        m_device->m_cachedSignaled.load(std::memory_order_acquire), &base
+    );
+    if (FAILED(hr))
+      return hr;
+    m_lockCount.increment();
+    *ppbData = static_cast<char *>(base) + OffsetToLock;
+    return D3D_OK;
+  }
+  if (!m_hostPtr)
+    return D3DERR_INVALIDCALL;
+  // A write lock stales the cache and nothing finer is recorded: the
+  // application does not truthfully report which bytes it wrote, and may still
+  // be writing after Unlock (d3d9_buffer_map.hpp).
+  if (buffer_lock_updates_dirty(Flags)) {
+    m_dirty = true;
+    m_writeLocked = true;
+    // refreshRange: so no byte of the current allocation is known to be current
+    // any more. Only a lock without NOOVERWRITE (after sanitisation, every lock
+    // outside the DEFAULT pool) allows changing bytes a recorded draw reads.
+    m_currentBegin = m_currentEnd = 0;
+    if (!(Flags & D3DLOCK_NOOVERWRITE)) {
+      m_renameDue = true;
+      m_renameEachStore = true;
+    }
+  }
+  m_lockCount.increment();
+  *ppbData = static_cast<char *>(m_hostPtr) + OffsetToLock;
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::Unlock() {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_Unlock);
+  D9DeviceLock lock = m_device->LockDevice();
+  // See MTLD3D9VertexBuffer::Unlock: the draw refreshes, not this.
+  if (m_lockCount.decrement() == 0) {
+    m_writeLocked = false;
+    // refreshRange: no lock without NOOVERWRITE is held any more.
+    m_renameEachStore = false;
+  }
+  return D3D_OK;
+}
+
+HRESULT STDMETHODCALLTYPE
+MTLD3D9IndexBuffer::GetDesc(D3DINDEXBUFFER_DESC *pDesc) {
+  D3D9_CENSUS(D3D9_CENSUS_MTLD3D9IndexBuffer_GetDesc);
+  D9DeviceLock lock = m_device->LockDevice();
+  if (!pDesc)
+    return D3DERR_INVALIDCALL;
+  pDesc->Format = m_format;
+  pDesc->Type = D3DRTYPE_INDEXBUFFER;
+  pDesc->Usage = m_usage;
+  pDesc->Pool = m_pool;
+  pDesc->Size = m_size;
+  return D3D_OK;
+}
+
+} // namespace dxmt

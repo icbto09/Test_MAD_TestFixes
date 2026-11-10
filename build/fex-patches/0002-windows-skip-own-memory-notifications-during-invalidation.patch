@@ -1,0 +1,162 @@
+Windows: skip FEX's own memory notifications raised during a code invalidation
+
+A code invalidation runs FEXCore code that frees and commits FEX's own
+memory: InvalidateThreadCachedCodeRange resets the call-ret stack
+(a decommit of up to 16 MB), the lookup caches drop pages, and a code
+buffer whose last reference goes away is released. On the iOS host Wine
+reports those calls back to FEX as memory notifications on the same
+thread. InvalidateAlignedInterval then invalidates again while the outer
+invalidation still holds CodeBufferListLock (a std::mutex, not
+recursive): the thread parks on that lock forever while write-owning
+CodeInvalidationMutex, and every other thread queues behind it on the
+code lock. With MADEIRA_INVALIDATION_NESTED=0 the same thread parks on
+CodeInvalidationMutex itself instead.
+
+Seen on .NET games since 0.2.0 (Stardew Valley 4 of 4 runs, Slay the
+Spire 2 in most logs): one [inval-nested] "invalidate" line from
+InvalidateAlignedInterval, then the owner parked on CTX+0x530
+(CodeBufferListLock) with [fexlock] STUCK read-waits behind it.
+
+InvalidateIntervalInternalLocked now records the thread that is inside
+it, and HandleMemoryProtectionNotification, InvalidateAlignedInterval
+and InvalidateContainingSection return at once for notifications raised
+on that thread while it is there, like the IntervalsLock re-entry skip.
+Only FEX's own code runs inside an invalidation, so such a notification
+is never about guest code. The skips are counted and reported from
+HandleImageMap as [inval-own-mem].
+
+Applies on FEX a77d5687 after 0001. Madeira-only: not for
+FEX-Emu.
+
+diff --git a/Source/Windows/Common/InvalidationTracker.cpp b/Source/Windows/Common/InvalidationTracker.cpp
+index b62bd1965..e4484c573 100644
+--- a/Source/Windows/Common/InvalidationTracker.cpp
++++ b/Source/Windows/Common/InvalidationTracker.cpp
+@@ -58,6 +58,11 @@ uint64_t InvalidationTracker::OwnedSharedMutex::Self() {
+ // they are counted and reported later from HandleImageMap, outside the lock.
+ static std::atomic<uint64_t> NestedNotificationSkips {0};
+ static std::atomic<uint64_t> NestedNotificationSkipsReported {0};
++// MADEIRA: memory notifications skipped because they were raised from inside this thread's own code
++// invalidation (InvalidatingThread). Counted, not logged: the allocator is mid-operation. Reported from
++// HandleImageMap, outside the locks, like NestedNotificationSkips.
++static std::atomic<uint64_t> OwnInvalidationSkips {0};
++static std::atomic<uint64_t> OwnInvalidationSkipsReported {0};
+ 
+ #if !defined(ARCHITECTURE_arm64ec)
+ InvalidationTracker::InvalidationTracker(FEXCore::Context::Context& CTX,
+@@ -105,6 +110,11 @@ void InvalidationTracker::HandleMemoryProtectionNotification(uint64_t Address, u
+     NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+     return;
+   }
++  if (InsideOwnInvalidation()) {
++    // FEX's own memory, allocated or reprotected while this thread invalidates: see InvalidatingThread.
++    OwnInvalidationSkips.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
+   const auto AlignedBase = Address & FEXCore::Utils::FEX_PAGE_MASK;
+   const auto AlignedSize = (Address - AlignedBase + Size + FEXCore::Utils::FEX_PAGE_SIZE - 1) & FEXCore::Utils::FEX_PAGE_MASK;
+ 
+@@ -302,6 +312,7 @@ void InvalidationTracker::HandleImageMap(std::string_view Name, uint64_t Address
+                         Skips);
+     }
+   }
++  ReportOwnInvalidationSkips();
+ 
+   FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
+   FEX_CONFIG_OPT(MaxInst, MAXINST);
+@@ -519,6 +530,11 @@ InvalidationTracker::InvalidateContainingSectionResult InvalidationTracker::Inva
+     NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+     return {Address, 0};
+   }
++  if (InsideOwnInvalidation()) {
++    // FEX's own memory, unmapped while this thread invalidates: see InvalidatingThread.
++    OwnInvalidationSkips.fetch_add(1, std::memory_order_relaxed);
++    return {Address, 0};
++  }
+   MEMORY_BASIC_INFORMATION Info;
+   if (NtQueryVirtualMemory(NtCurrentProcess(), reinterpret_cast<void*>(Address), MemoryBasicInformation, &Info, sizeof(Info), nullptr)) {
+     return {Address, 0};
+@@ -579,6 +595,13 @@ void InvalidationTracker::InvalidateAlignedInterval(uint64_t Address, uint64_t S
+     NestedNotificationSkips.fetch_add(1, std::memory_order_relaxed);
+     return;
+   }
++  if (InsideOwnInvalidation()) {
++    // FEX's own memory, freed or decommitted while this thread invalidates (a lookup-cache page, the
++    // call-ret stack, a released code buffer): see InvalidatingThread. Invalidating here would take
++    // CodeBufferListLock again on this thread and park it for good.
++    OwnInvalidationSkips.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
+   if (!Address) {
+     // Match the Windows behaviour when passed a NULL base address.
+     Size = std::numeric_limits<uint64_t>::max();
+@@ -1038,8 +1061,33 @@ void InvalidationTracker::InvalidateIntervalInternal(uint64_t Address, uint64_t
+   }
+ }
+ 
++void InvalidationTracker::ReportOwnInvalidationSkips() {
++  const auto Skips = OwnInvalidationSkips.load(std::memory_order_relaxed);
++  auto Reported = OwnInvalidationSkipsReported.load(std::memory_order_relaxed);
++  if (Skips != Reported && OwnInvalidationSkipsReported.compare_exchange_strong(Reported, Skips)) {
++    LogMan::Msg::EFmt("[inval-own-mem] {} memory notification(s) for FEX's own memory raised during a code invalidation on the "
++                      "same thread were skipped (invalidating again would wait on CodeBufferListLock forever)",
++                      Skips);
++  }
++}
++
+ void InvalidationTracker::InvalidateIntervalInternalLocked(uint64_t Address, uint64_t Size) {
+   // NOTE: This assumes CodeInvalidationMutex is locked by the caller
++  // MADEIRA: mark this thread as invalidating for the memory notifications FEXCore's own frees raise below
++  // (see InvalidatingThread). The caller write-owns CodeInvalidationMutex, so no other thread writes the
++  // slot meanwhile; a nested call (LockCodeInvalidationUnlessHeld) restores the outer mark on return.
++  struct InvalidatingScope {
++    std::atomic<uint64_t>& Slot;
++    uint64_t Previous;
++    explicit InvalidatingScope(std::atomic<uint64_t>& Slot)
++      : Slot {Slot}
++      , Previous {Slot.load(std::memory_order_relaxed)} {
++      Slot.store(OwnedSharedMutex::Self(), std::memory_order_relaxed);
++    }
++    ~InvalidatingScope() {
++      Slot.store(Previous, std::memory_order_relaxed);
++    }
++  } Scope {InvalidatingThread};
+ #if !defined(ARCHITECTURE_arm64ec)
+   // The boundary into FEXCore: Address is a host address, FEXCore's code buffers and lookup caches
+   // are keyed on guest addresses. Clip the range to the window and convert; the part outside the
+diff --git a/Source/Windows/Common/InvalidationTracker.h b/Source/Windows/Common/InvalidationTracker.h
+index 7eefac405..2f015c68a 100644
+--- a/Source/Windows/Common/InvalidationTracker.h
++++ b/Source/Windows/Common/InvalidationTracker.h
+@@ -134,8 +134,9 @@ private:
+     bool HeldByThisThread() const {
+       return Owner.load(std::memory_order_relaxed) == Self();
+     }
+-  private:
++    // The calling thread's identity, as stored in Owner.
+     static uint64_t Self();
++  private:
+     std::shared_mutex Mutex;
+     std::atomic<uint64_t> Owner {0};
+   };
+@@ -162,6 +163,20 @@ private:
+   // Forgets hot pages in [Begin, End) when their memory is freed.
+   void ForgetHotSMCPages(uint64_t Begin, uint64_t End);
+ 
++  // MADEIRA: the thread currently inside InvalidateIntervalInternalLocked (OwnedSharedMutex::Self(), 0 when
++  // none). Only a write owner of CodeInvalidationMutex gets there, so one slot is enough. FEXCore frees and
++  // commits its own memory while it invalidates (lookup-cache pages, the call-ret stack, a released code
++  // buffer); Wine reports that back as memory notifications on the same thread, which would invalidate again
++  // under CodeBufferListLock (not recursive) and wait on themselves. Notifications raised from inside an
++  // invalidation are FEX's own memory, never guest code, so they are skipped (see InsideOwnInvalidation).
++  std::atomic<uint64_t> InvalidatingThread {0};
++  // Logs how many notifications InsideOwnInvalidation skipped since the last report (outside any lock).
++  static void ReportOwnInvalidationSkips();
++  bool InsideOwnInvalidation() const {
++    const auto Thread = InvalidatingThread.load(std::memory_order_relaxed);
++    return Thread && Thread == OwnedSharedMutex::Self();
++  }
++
+   // MADEIRA: locks CodeInvalidationMutex exclusively unless this thread already write-owns it.
+   // Returns whether it locked; the caller unlocks only then.
+   bool LockCodeInvalidationUnlessHeld(const char* Path, uint64_t Address);

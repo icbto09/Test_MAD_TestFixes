@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="${ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+DERIVED="$ROOT/app/DerivedData"
+DIST="$ROOT/dist"
+# Debug is the configuration that runs games (docs/BUILDING.md); Release builds
+# have crashed the guest.
+CONFIGURATION="${CONFIGURATION:-Debug}"
+APP="$DERIVED/Build/Products/$CONFIGURATION-iphoneos/Madeira.app"
+
+required=(
+  "$ROOT/FEX/build-ios/FEXCore/Source/libFEXCore.a"
+  "$ROOT/FEX/build-ios/FEXCore/Source/libFEXCore_Base.a"
+  "$ROOT/FEX/build-ios/External/fmt/libfmt.a"
+  "$ROOT/FEX/build-ios/External/cephes/libcephes_128bit.a"
+  "$ROOT/app/Madeira/libwineserver.a"
+  "$ROOT/app/Madeira/libntdll_unix.a"
+  "$ROOT/app/Madeira/libwin32u_unix.a"
+  "$ROOT/app/Madeira/libdxmt_combined.a"
+  "$ROOT/app/Madeira/libmadeira_rppairing.a"
+)
+for path in "${required[@]}"; do
+  [[ -f "$path" ]] || { echo "ERROR: required build artifact missing: $path" >&2; exit 1; }
+done
+
+python3 "$ROOT/tools/build/runtime-components.py" verify all
+
+# [gl-wow64-patch] libntdll_unix.a must carry opengl32's converted 32-bit thunks
+# (patches/wine-opengl-winios.patch, applied by build/ntdll-unix/build.sh);
+# without them every 32-bit OpenGL game crashes at start. The string is one
+# only the patched unix_wgl.c has. MADEIRA_WINE_OPENGL_PATCH=0 skips the check.
+if [[ "${MADEIRA_WINE_OPENGL_PATCH:-1}" != 0 ]]; then
+  python3 "$ROOT/tests/host/check-wine-opengl-patch.py" --lib "$ROOT/app/Madeira/libntdll_unix.a"
+fi
+
+rm -rf "$DERIVED" "$DIST/Payload"
+mkdir -p "$DIST"
+
+xcodebuild \
+  -project "$ROOT/app/Madeira.xcodeproj" \
+  -scheme Madeira \
+  -configuration "$CONFIGURATION" \
+  -sdk iphoneos \
+  -destination 'generic/platform=iOS' \
+  -derivedDataPath "$DERIVED" \
+  IPHONEOS_DEPLOYMENT_TARGET=18.0 \
+  CODE_SIGNING_ALLOWED=NO \
+  CODE_SIGNING_REQUIRED=NO \
+  CODE_SIGN_IDENTITY='' \
+  build
+
+[[ -d "$APP" ]] || { echo "ERROR: xcodebuild succeeded but Madeira.app is missing" >&2; exit 1; }
+
+python3 "$ROOT/tools/build/runtime-components.py" bundle "$APP"
+
+# Preserve Madeira's requested JIT/debug entitlements in the IPA. SideStore will
+# replace this ad-hoc signature with the user's development signature while
+# retaining the supported entitlements.
+codesign --force --sign - \
+  --entitlements "$ROOT/app/Madeira/Madeira.entitlements" \
+  "$APP"
+
+bundle_required=(
+  "$APP/Madeira"
+  "$APP/prefix-template.tar.gz"
+  "$APP/arm64ec-windows/xtajit64.dll"
+  "$APP/x86_64-vcruntime/vcruntime140.dll"
+)
+for path in "${bundle_required[@]}"; do
+  [[ -e "$path" ]] || { echo "ERROR: required bundle resource missing: $path" >&2; exit 1; }
+done
+# The bundled ntdll must have the loader's TLS index sync (wine 694442e4); without
+# it a DLL with TLS loaded after start reads the main program's TLS block.
+python3 "$ROOT/tests/host/check-ntdll-tls-sync.py" "$APP/arm64ec-windows/ntdll.dll"
+codesign -d --entitlements :- "$APP" 2>/dev/null | grep -q 'com.apple.security.cs.allow-jit' || {
+  echo "ERROR: packaged app is missing the allow-jit entitlement" >&2
+  exit 1
+}
+
+mkdir -p "$DIST/Payload"
+ditto "$APP" "$DIST/Payload/Madeira.app"
+rm -f "$DIST/Madeira.ipa"
+(
+  cd "$DIST"
+  /usr/bin/zip -qry Madeira.ipa Payload
+)
+rm -rf "$DIST/Payload"
+[[ -s "$DIST/Madeira.ipa" ]] || { echo "ERROR: failed to create IPA" >&2; exit 1; }
+unzip -tq "$DIST/Madeira.ipa" >/dev/null
+python3 "$ROOT/tools/build/runtime-components.py" ipa "$DIST/Madeira.ipa"

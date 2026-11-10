@@ -1,0 +1,233 @@
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+index c5b7499..db308c1 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.h
+@@ -150,10 +150,22 @@ protected:
+ 	void decompressMSL(std::string& msl);
+ 	MVKCompressor<std::string>& getCompressedMSL() { return _compressedMSL; }
+ 
++	// Madeira shader library dropping (MADEIRA_MVK_DROP_SHADER_LIBRARIES): the compiled
++	// MTLLibrary is released after each function is made from it, and compiled again from
++	// the stored MSL the next time a function is needed. Libraries read back from a saved
++	// pipeline cache are not compiled until a pipeline first asks for them.
++	bool madeiraEnsureMTLLibrary();
++	void madeiraDropMTLLibrary();
++
+ 	MVKVulkanAPIDeviceObject* _owner;
+-	id<MTLLibrary> _mtlLibrary;
++	id<MTLLibrary> _mtlLibrary = nil;
+ 	MVKCompressor<std::string> _compressedMSL;
+ 	mvk::SPIRVToMSLConversionResultInfo _shaderConversionResultInfo;
++	std::vector<std::pair<uint32_t, MVKShaderMacroValue>> _madeiraMacroDef;	// for recompiling a macro variant
++	std::mutex _madeiraLibLock;
++	bool _madeiraHasMacroDef = false;
++	bool _madeiraCanRecompile = false;		// true when built from MSL that is stored here
++	bool _madeiraCompileFailed = false;
+ 
+ 	/** When true, representing a library created with source, but never specialized */
+ 	bool _maySpecializeWithMacro;
+diff --git a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+index 3aa44a4..f40e352 100644
+--- a/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
++++ b/MoltenVK/MoltenVK/GPUObjects/MVKShaderModule.mm
+@@ -20,10 +20,47 @@
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+ #include <sys/stat.h>
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace std;
+ using namespace mvk;
+ 
++
++#pragma mark - Madeira shader library dropping
++
++// Opt-in with the environment variable MADEIRA_MVK_DROP_SHADER_LIBRARIES=1 (any value except "0").
++// MoltenVK keeps a compiled MTLLibrary for every shader variant for as long as the pipeline
++// cache (or shader module) lives, and compiles every library in a saved pipeline cache as soon
++// as the cache is loaded. Games that build ~100,000 pipelines (Detroit: Become Human) run out
++// of memory that way on iOS. With dropping on, the MTLLibrary is released once a function has
++// been made from it, libraries read from a saved cache are compiled only when first needed, and
++// a dropped library is compiled again from its stored MSL if another pipeline needs it.
++static bool mvkMadeiraDropShaderLibraries() {
++	static const bool isEnabled = [] {
++		const char* val = getenv("MADEIRA_MVK_DROP_SHADER_LIBRARIES");
++		bool enabled = val && *val && strcmp(val, "0") != 0;
++		fprintf(stderr, "[mvk-madeira] shader library dropping %s (MADEIRA_MVK_DROP_SHADER_LIBRARIES=%s)\n",
++				enabled ? "ON" : "off", val ? val : "unset");
++		return enabled;
++	}();
++	return isEnabled;
++}
++
++static std::atomic<uint64_t> sMadeiraLibsDropped(0);
++static std::atomic<uint64_t> sMadeiraLibsCompiledOnDemand(0);
++static std::atomic<uint64_t> sMadeiraLibsDeferredAtLoad(0);
++
++static void mvkMadeiraLogLibCounts(const char* event) {
++	fprintf(stderr, "[mvk-madeira] libraries %s: dropped %llu, compiled on demand %llu, deferred at cache load %llu\n",
++			event,
++			(unsigned long long)sMadeiraLibsDropped.load(),
++			(unsigned long long)sMadeiraLibsCompiledOnDemand.load(),
++			(unsigned long long)sMadeiraLibsDeferredAtLoad.load());
++}
++
+ MVKMTLFunction::MVKMTLFunction(id<MTLFunction> mtlFunc, const SPIRVToMSLConversionResultInfo scRslts, MTLSize tgSize) {
+ 	_mtlFunction = [mtlFunc retain];		// retained
+ 	shaderConversionResults = scRslts;
+@@ -73,9 +110,17 @@ MVKMTLFunction MVKShaderLibrary::getMTLFunction(const VkSpecializationInfo* pSpe
+ 												VkPipelineCreationFeedback* pShaderFeedback,
+ 												MVKShaderModule* shaderModule) {
+ 
+-	if ( !_mtlLibrary ) { return MVKMTLFunctionNull; }
++	// Madeira: with library dropping on, this library (and its macro variants) may be compiled,
++	// used and dropped here by several pipeline-creation threads at once, so serialize them.
++	bool madeiraDrop = mvkMadeiraDropShaderLibraries();
++	std::unique_lock<std::mutex> madeiraLock(_madeiraLibLock, std::defer_lock);
++	if (madeiraDrop) { madeiraLock.lock(); }
++
++	bool madeiraCanCompileLater = madeiraDrop && _madeiraCanRecompile && !_madeiraCompileFailed;
++	if ( !_mtlLibrary && !madeiraCanCompileLater ) { return MVKMTLFunctionNull; }
+ 
+ 	id<MTLLibrary> lib = _mtlLibrary;
++	MVKShaderLibrary* madeiraLibOwner = this;	// the library (or macro variant) the function comes from
+ 
+ 	// If specialization happens on constants mapped to macro, find or compile a library variant
+ 	// with proper macro definition instead of the "generic" library
+@@ -101,14 +146,21 @@ MVKMTLFunction MVKShaderLibrary::getMTLFunction(const VkSpecializationInfo* pSpe
+ 			auto entry = _specializationVariants.find(spec_list);
+ 			if (entry != _specializationVariants.end()) {
+ 				lib = entry->second->_mtlLibrary;
++				madeiraLibOwner = entry->second;
+ 			} else {
+ 				MVKShaderLibrary *new_mvklib = new MVKShaderLibrary(_owner, _shaderConversionResultInfo, _compressedMSL, &spec_list);
+ 				_specializationVariants[spec_list] = new_mvklib;
+ 				lib = new_mvklib->_mtlLibrary;
++				madeiraLibOwner = new_mvklib;
+ 			}
+ 		}
+ 	}
+ 
++	// Madeira: compile the chosen library now if it was dropped or deferred at cache load.
++	if (madeiraDrop) {
++		if ( !madeiraLibOwner->madeiraEnsureMTLLibrary() ) { return MVKMTLFunctionNull; }
++		lib = madeiraLibOwner->_mtlLibrary;
++	}
+ 
+ 	@synchronized (getMTLDevice()) {
+ 		@autoreleasepool {
+@@ -167,13 +219,52 @@ MVKMTLFunction MVKShaderLibrary::getMTLFunction(const VkSpecializationInfo* pSpe
+ 			_owner->setMetalObjectLabel(mtlFunc, dbName);
+ 
+ 			auto& wgSize = _shaderConversionResultInfo.entryPoint.workgroupSize;
+-			return MVKMTLFunction(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
+-																					getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
+-																					getWorkgroupDimensionSize(wgSize.depth, pSpecializationInfo)));
++			MVKMTLFunction mvkFunc(mtlFunc, _shaderConversionResultInfo, MTLSizeMake(getWorkgroupDimensionSize(wgSize.width, pSpecializationInfo),
++																					 getWorkgroupDimensionSize(wgSize.height, pSpecializationInfo),
++																					 getWorkgroupDimensionSize(wgSize.depth, pSpecializationInfo)));
++
++			// Madeira: the function now stands on its own, so let the library go. When the function
++			// came from a macro variant, the base library isn't needed either: new variants are
++			// compiled from the stored MSL, and the base is compiled again if it's asked for.
++			if (madeiraDrop && mtlFunc) {
++				madeiraLibOwner->madeiraDropMTLLibrary();
++				if (madeiraLibOwner != this) { madeiraDropMTLLibrary(); }
++			}
++
++			return mvkFunc;
+ 		}
+ 	}
+ }
+ 
++// Madeira: makes sure _mtlLibrary is compiled, compiling it from the stored MSL if it was
++// dropped or deferred. Returns whether a library is available. Called with _madeiraLibLock
++// held (by this library, or by the base library for a macro variant).
++bool MVKShaderLibrary::madeiraEnsureMTLLibrary() {
++	if (_mtlLibrary) { return true; }
++	if ( !_madeiraCanRecompile || _madeiraCompileFailed ) { return false; }
++
++	string msl;
++	decompressMSL(msl);
++	compileLibrary(msl, _madeiraHasMacroDef ? &_madeiraMacroDef : nullptr);
++	if ( !_mtlLibrary ) {
++		_madeiraCompileFailed = true;	// don't recompile on every pipeline
++		fprintf(stderr, "[mvk-madeira] on-demand library compile failed\n");
++		return false;
++	}
++	uint64_t n = ++sMadeiraLibsCompiledOnDemand;
++	if (n == 1 || n % 1000 == 0) { mvkMadeiraLogLibCounts("compile on demand"); }
++	return true;
++}
++
++// Madeira: releases the compiled library if it can be compiled again from stored MSL.
++void MVKShaderLibrary::madeiraDropMTLLibrary() {
++	if ( !_madeiraCanRecompile || !_mtlLibrary ) { return; }
++	[_mtlLibrary release];
++	_mtlLibrary = nil;
++	uint64_t n = ++sMadeiraLibsDropped;
++	if (n == 1 || n % 1000 == 0) { mvkMadeiraLogLibCounts("drop"); }
++}
++
+ void MVKShaderLibrary::setEntryPointName(string& funcName) {
+ 	_shaderConversionResultInfo.entryPoint.mtlFunctionName = funcName;
+ }
+@@ -207,7 +298,9 @@ MVKShaderLibrary::MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
+ 
+ 	_shaderConversionResultInfo = conversionResult.resultInfo;
+ 	compressMSL(conversionResult.msl);
++	_madeiraCanRecompile = true;
+ 	compileLibrary(conversionResult.msl);
++	_madeiraCompileFailed = !_mtlLibrary;	// Madeira: no on-demand retry of a failed compile
+ }
+ 
+ MVKShaderLibrary::MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
+@@ -220,9 +313,23 @@ MVKShaderLibrary::MVKShaderLibrary(MVKVulkanAPIDeviceObject* owner,
+ 
+ 	_shaderConversionResultInfo = resultInfo;
+ 	_compressedMSL = compressedMSL;
++	_madeiraCanRecompile = true;
++	if (specializationMacroDef) {
++		_madeiraMacroDef = *specializationMacroDef;
++		_madeiraHasMacroDef = true;
++	}
++
++	// Madeira: a library read back from a saved pipeline cache waits until a pipeline needs it.
++	if (mvkMadeiraDropShaderLibraries() && !specializationMacroDef) {
++		uint64_t n = ++sMadeiraLibsDeferredAtLoad;
++		if (n == 1 || n % 5000 == 0) { mvkMadeiraLogLibCounts("deferred at cache load"); }
++		return;
++	}
++
+ 	string msl;
+ 	decompressMSL(msl);
+ 	compileLibrary(msl, specializationMacroDef);
++	_madeiraCompileFailed = !_mtlLibrary;	// Madeira: no on-demand retry of a failed compile
+ }
+ 
+ void MVKShaderLibrary::compileLibrary(const string& msl,
+@@ -276,6 +383,10 @@ MVKShaderLibrary::MVKShaderLibrary(const MVKShaderLibrary& other) :
+ 	_mtlLibrary = [other._mtlLibrary retain];
+ 	_shaderConversionResultInfo = other._shaderConversionResultInfo;
+ 	_compressedMSL = other._compressedMSL;
++	_madeiraMacroDef = other._madeiraMacroDef;
++	_madeiraHasMacroDef = other._madeiraHasMacroDef;
++	_madeiraCanRecompile = other._madeiraCanRecompile;
++	_madeiraCompileFailed = other._madeiraCompileFailed;
+ }
+ 
+ MVKShaderLibrary& MVKShaderLibrary::operator=(const MVKShaderLibrary& other) {
+@@ -286,6 +397,10 @@ MVKShaderLibrary& MVKShaderLibrary::operator=(const MVKShaderLibrary& other) {
+ 	_owner = other._owner;
+ 	_shaderConversionResultInfo = other._shaderConversionResultInfo;
+ 	_compressedMSL = other._compressedMSL;
++	_madeiraMacroDef = other._madeiraMacroDef;
++	_madeiraHasMacroDef = other._madeiraHasMacroDef;
++	_madeiraCanRecompile = other._madeiraCanRecompile;
++	_madeiraCompileFailed = other._madeiraCompileFailed;
+ 	return *this;
+ }
+ 
