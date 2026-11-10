@@ -40,11 +40,13 @@ Not in this build: the Get Help key (private), so Get Help does not work.
 The Test 8 source bundle leaves out the built files that the Madeira repository keeps in git.
 They are restored here so the tree has the shape the build expects:
 - `app/Madeira/arm64ec-windows/`, `app/Madeira/aarch64-windows/`,
-  `app/Madeira/vulkan/arm64ec-windows/{vulkan-1,winevulkan}.dll` and
-  `app/Madeira/d3d12/libmetalirconverter.dylib` come from the Test 8 (Nov 10) IPA, so they
-  match this source. Left out: `dockhost.exe`, `dock-notices.txt` (built by the dock
+  `app/Madeira/vulkan/arm64ec-windows/{vulkan-1,winevulkan}.dll` come from the Test 8
+  (Nov 10) IPA, so they match this source. Left out: `dockhost.exe`, `dock-notices.txt` (built by the dock
   component) and the `*.source` build stamp. The file names in the two runtime folders
   select which Wine modules the build compiles (`build/windows-runtime/targets.py`).
+- `app/Madeira/d3d12/libmetalirconverter.dylib` comes from the public Madeira repository
+  (8b52c18). The build pins its SHA-256 (`build/madeira-d3d12/deps.sh`); the copy inside an
+  IPA has been re-signed and no longer matches.
 - The diagnostic test programs under `tests/`, the test shaders in `madeira-d3d12/shaders/`
   and `build/tftrace/tftrace-x64.dll` come from the public Madeira repository (8b52c18).
 - Not restored: `app/Madeira/lib{gmp,gnutls,hogweed,nettle}.a` and `app/libdxmt_unix.a`.
