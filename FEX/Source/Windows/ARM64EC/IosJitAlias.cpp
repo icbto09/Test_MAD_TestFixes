@@ -1,0 +1,651 @@
+// SPDX-License-Identifier: MIT
+// iOS JIT-pool alias table.
+//
+// On iOS, ARM64EC PE images cannot run from their loaded address (iOS rejects
+// mprotect(RX) on file-backed mmaps). Wine's ntdll-unix copies each PE image
+// into the dual-mapped JIT pool. Code in the copied image executes from the
+// alias address, not the original PE address.
+//
+// FEX's range trackers only know the ORIGINAL PE address ranges, so they
+// report alias addresses as non-executable. The lookup wrappers in
+// Module.cpp call IosJitReverseTranslate to map alias → PE-original for
+// the tracker query, then IosJitTranslate to map the result back.
+//
+// Lives in a separate TU from Module.cpp because accessing the table's
+// global storage directly from ARM64EC class methods in Module.cpp produced
+// a "misaligned ldr/str offset" link error — probably an ADRP+LDR
+// page-offset issue in the hybrid emit. Putting the data + accessors in
+// their own TU sidesteps the issue.
+
+#include <cstdint>
+#include <atomic>
+#include <FEXCore/Utils/LogManager.h>
+#include <windows.h>
+#include <winternl.h>
+#include "IosMonoBridge.h"
+
+#ifdef FEX_IOS_HOST
+
+struct IosAliasEntry {
+  uint64_t PeBase;
+  uint64_t JitBase;
+  uint64_t Size;
+  uint64_t _Padding;  // Keeps the struct 32-byte to make array stride a power of 2.
+};
+constexpr int kMaxEntries = 256;
+
+// extern "C" storage (not anonymous-namespace) so Module.S's ExitFunctionEC
+// can reach the table via adrp/:lo12: — it translates the branch target
+// PE VA → pool VA inline before jumping to native EC code. That asm relies
+// on the 32-byte stride and the PeBase/JitBase/Size field order.
+extern "C" {
+IosAliasEntry IosAliasEntries[kMaxEntries];
+volatile int IosAliasCount = 0;
+
+// 2026-09-23 LAST-HIT CACHE. Index of the entry that satisfied the most recent
+// lookup, probed by Module.S BEFORE the linear scan.
+//
+// Race-free by construction, which is why it is an INDEX and not a copy of the
+// entry: a single naturally-aligned 32-bit load/store is atomic on AArch64, so a
+// reader sees some index that was published at some point, never a torn one. The
+// probe then RE-TESTS that entry's PeBase/Size against the target, so a stale or
+// retired index simply misses and falls into the scan. No generation counter, no
+// barrier, and nothing a wrong value can do beyond costing one extra compare.
+//
+// Module.S masks the value with 0xFF instead of range-checking it, so kMaxEntries
+// must stay a power of two no larger than 256.
+volatile int IosAliasHot = 0;
+
+// [0] = calls whose target was translated to its JIT-pool copy inline,
+// [1] = targets left in PE space (no entry matched, and not already in the
+//       pool) — each of those really does cost a Mach exception round trip
+//       through the unix-side exec-fault redirect,
+// [2] = ml990: targets that were ALREADY pool addresses and needed no
+//       translation at all (see IosAliasJitSpan below),
+// [3] = reserved.
+// Printed as `[ec-call] translated=N faulted=M inpool=P` by the ntdll-unix
+// stats reporter, which reads this array through the pool copy of this image.
+// Plain increments: a lost count under contention is cheaper than a bus-locked
+// RMW on this path, and the number is a diagnostic, not a decision input.
+//
+// ml990 SPLIT [1] IN TWO BECAUSE IT WAS MEASURING THE WRONG THING. Device log
+// q1 reported faulted climbing by ~14 M per 10 s window while "exec-fault
+// redirects" — the ntdll-unix counter for exec faults the Mach handler
+// actually fixed up — moved by ~2100 in the same window. Four orders of
+// magnitude apart, so those were never faults: they were the RETURN half of
+// the transition, whose target is already running out of the pool.
+uint64_t IosAliasStats[4] = {0, 0, 0, 0};
+
+/* ml990: {lo, hi - lo} over every registered JitBase..JitBase+Size, i.e. the
+ * part of the JIT pool that alias translation can ever PRODUCE.
+ *
+ * WHY. ExitFunctionEC is reached on two kinds of transition and only one of
+ * them has anything to translate:
+ *
+ *   CALL   x9 is a PE virtual address (it came from the EcCodeBitMap or from a
+ *          relocation), and the whole point of the table is to turn it into the
+ *          pool copy that iOS will actually let us execute.
+ *   RETURN x9 is the instruction after a `blr x16` inside an exit thunk that is
+ *          ALREADY EXECUTING — so it is already a pool address.
+ *
+ * The scan in Module.S only ever matches a PeBase range, so a return address
+ * walked all ~50 entries, matched nothing, bumped IosAliasStats[1] and fell
+ * through with x9 unchanged.  Unchanged is the correct answer; the walk is the
+ * most expensive imaginable way to reach it, and q1 measured 1.4 M of them per
+ * second with `ExitFunctionEC+0xc` at 6.4 % of ALL CPU.
+ *
+ * A single unsigned compare answers it: (x9 - lo) < span.
+ *
+ * SAFETY. The fast-out changes behaviour only if some address inside the Jit
+ * span would ALSO have matched a PeBase range in the scan.  PE images and the
+ * pool live in different bands of the address space, so that cannot happen —
+ * but the invariant is CHECKED rather than asserted: MaintainSpan() drops the
+ * span to zero the moment a registration makes a PeBase range intersect it,
+ * and a zero span makes the compare in Module.S always fail, which is the
+ * pre-ml990 path instruction for instruction.  The same zero is what
+ * MADEIRA_EC_POOL_FASTOUT=0 installs, so the knob and the safety net share one
+ * mechanism and one tested code path.
+ *
+ * 16-byte aligned so Module.S can take both halves with one ldp. */
+__attribute__((aligned(16))) uint64_t IosAliasJitSpan[2] = {0, 0};
+
+/* ml990: MADEIRA_EC_POOL_FASTOUT=0 turns the above off (span stays 0). Read
+ * once in ProcessInit, like IosFfsBypassEnable. */
+volatile int IosEcPoolFastOut = 1;
+
+// 2026-09-23 BISECT SWITCH for ExitToX64's fast-forward-sequence bypass.
+//
+// Enabling FEX_IOS_HOST for Module.S switched on four mechanisms at once that
+// had never executed on a device: the TEB-from-TSD reads, the JIT-pool alias
+// translation (the fix), the code-buffer sweep gate, and this bypass. Three of
+// them are either verified statically or are the counterpart of C++ code that
+// was already running one-sided. The bypass is the one that CHANGES DISPATCH
+// BEHAVIOUR for native EC callers, so it gets an off switch:
+// MADEIRA_EC_FFS_BYPASS=0 restores the plain emulation round trip without
+// giving up the alias translation. Read once in ProcessInit; the asm tests it
+// with two instructions on a path that is about to clobber x16 anyway.
+volatile int IosFfsBypassEnable = 1;
+/* ml1116: the entry that satisfied the last translation, checked first by
+ * Module.S before the walk. A pointer (one atomic 8-byte store) rather than a
+ * copy of the fields, so a reader can never see a torn entry; a retired entry
+ * has Size 0 and simply misses. The walk itself now runs NEWEST-FIRST: the
+ * images the game calls (its own EC ntdll/kernel32/kernelbase, the D3D12
+ * runtime) are registered late, so oldest-first cost ~150 iterations per
+ * x64->EC call at up to a million calls a second. */
+IosAliasEntry* volatile IosAliasLast = nullptr;
+}
+
+static_assert(kMaxEntries == 256, "Module.S bounds IosAliasHot with `and #0xff`");
+
+namespace {
+IosAliasEntry* const g_Entries = IosAliasEntries;
+volatile int& g_EntryCount = IosAliasCount;
+
+/* The lowest JitBase and the highest JitBase + Size of any entry ever added, widened before the entry
+ * is published and never narrowed: an address outside them is in no entry, so IosJitReverseTranslate
+ * answers it without walking the table (every block lookup the dispatcher misses asks it). */
+uint64_t g_JitLow = ~0ULL;
+uint64_t g_JitHigh = 0;
+
+void WidenJitBounds(uint64_t JitBase, uint64_t Size) {
+  uint64_t Low = __atomic_load_n(&g_JitLow, __ATOMIC_RELAXED);
+  while (JitBase < Low && !__atomic_compare_exchange_n(&g_JitLow, &Low, JitBase, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+  }
+  uint64_t High = __atomic_load_n(&g_JitHigh, __ATOMIC_RELAXED);
+  while (JitBase + Size > High &&
+         !__atomic_compare_exchange_n(&g_JitHigh, &High, JitBase + Size, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+  }
+}
+}  // namespace
+
+extern "C" {
+
+// ml357: STALE ALIASES ARE FATAL, and the old de-dupe guaranteed them.
+//
+// The previous rule was "same PeBase = already registered, ignore" — so a DLL
+// that unloaded and was replaced at the same (or an overlapping) PE VA kept
+// FEX pointing at the ORIGINAL pool copy forever. That copy is tombstoned and
+// eventually reclaimed/zeroed, so every guest RIP in the new module translated
+// into dead memory: ml356 died executing a page of zeros (udf → c000001d) one
+// instruction after wevtapi.dll loaded INSIDE a departed module's old range.
+//
+// Wine's own table (ios_jit_add_mapping) already purges by OVERLAP for exactly
+// this reason; this is that rule's missing twin on the FEX side. Tombstone
+// order matches wine's: Size = 0 first (a zero-size entry matches no range
+// query, including Module.S's inline asm walk), barrier, then reuse the slot.
+/* iOS-Madeira ml549: EXACT guest RIP from a host PC, for the unix-side fault probes.
+ *
+ * The Mach handlers in ntdll-unix read the guest RIP from CpuStateFrame+0x18, which FEX
+ * only syncs at BLOCK boundaries -- it names the calling block, not the instruction that
+ * ran. ml548 disassembled such a RIP and got call setup instead of the store it was
+ * hunting, which is why the render-corruption writer could never be identified.
+ *
+ * FEX already stores a host-PC -> guest-RIP table in every JIT block tail and walks it
+ * for exception reconstruction. ios_fex_rip_from_hostpc (Core.cpp) is that walk without
+ * the Thread dependency; this is its EC export so the unix side can reach it through the
+ * same bind-and-push path as BTCpu64IosAddAliasMapping.
+ *
+ * Zero runtime cost: nothing is instrumented, the table already exists. Returns 0 when
+ * the PC is outside the block, so a caller can distinguish "no answer" from a real RIP. */
+uint64_t BTCpu64IosRipFromHostPC(uint64_t BlockBegin, uint64_t HostPC) {
+  extern uint64_t ios_fex_rip_from_hostpc(uint64_t, uint64_t);
+  return ios_fex_rip_from_hostpc(BlockBegin, HostPC);
+}
+
+/* ============================ ml648 MONO BRIDGE ============================
+ * Owned here rather than in Module.cpp for the same reason the alias table is:
+ * reaching global storage from ARM64EC class methods there produced misaligned
+ * ldr/str link errors. Kept in a DIFFERENT table from IosAliasEntries — see
+ * IosMonoBridge.h. */
+ios_mono_bridge* g_MonoBridge = nullptr;
+
+extern void ios_fex_mono_bridge_publish(void* Bridge);      // Core.cpp: has the types
+extern void ios_fex_mono_report_armed(uint64_t, uint64_t);  // Core.cpp: has LogMan
+
+void BTCpu64IosSetMonoBridge(uint64_t BridgeAddr) {
+  auto* B = reinterpret_cast<ios_mono_bridge*>(BridgeAddr);
+  if (!B || B->abi_version != IOS_MONO_ABI_VERSION) {
+    // Refuse rather than arm a struct whose layout we cannot trust — the native
+    // side reads it inside a Mach fault handler.
+    return;
+  }
+  g_MonoBridge = B;
+  ios_fex_mono_bridge_publish(B);
+}
+
+/* Resolve a guest RX address to its writable alias. Sequence-lock read exactly
+ * as the writer publishes: sample the generation, read, sample again, and
+ * accept only when both are equal and ODD. A retired-and-reused slot therefore
+ * misses instead of returning a stale mapping — which would put a guest code
+ * write into memory that no longer backs it. Returns 0 on miss; the caller
+ * counts it and falls back rather than guessing. */
+uint64_t IosMonoResolveRW(uint64_t GuestAddr, uint64_t Size) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return 0;
+  }
+  const uint32_t Count = __atomic_load_n(&B->alias_count, __ATOMIC_ACQUIRE);
+  for (uint32_t i = 0; i < Count && i < IOS_MONO_MAX_ALIASES; i++) {
+    const uint32_t G1 = __atomic_load_n(&B->aliases[i].generation, __ATOMIC_ACQUIRE);
+    if (!(G1 & 1)) {
+      continue;  // retired or mid-update
+    }
+    const uint64_t Base = B->aliases[i].guest_rx;
+    const uint64_t Sz = B->aliases[i].size;
+    const uint64_t RW = B->aliases[i].host_rw;
+    const uint32_t G2 = __atomic_load_n(&B->aliases[i].generation, __ATOMIC_ACQUIRE);
+    if (G1 != G2) {
+      continue;  // changed under us
+    }
+    if (GuestAddr >= Base && GuestAddr + Size <= Base + Sz) {
+      return RW + (GuestAddr - Base);
+    }
+  }
+  return 0;
+}
+/* Called from InvalidationTracker the moment the Mono module is recognised.
+ * Until this runs, mono_base is 0 and the native Mach handler declines every
+ * capture — the ordering the design depends on, enforced by construction. */
+void ios_fex_mono_arm(uint64_t Base, uint64_t End) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return;
+  }
+  B->mono_end = End;
+  __atomic_store_n(&B->mono_base, Base, __ATOMIC_RELEASE);  // publish LAST: it is the gate
+  ios_fex_mono_report_armed(Base, End);
+}
+
+/* Take this context's pending event, if any. One-shot: the slot moves to state 2
+ * and never fires again for this process, so a mis-detection cannot loop.
+ *
+ * Keyed by PEB because pseudo-processes share one address space — a global slot
+ * would let one process's fault mark another process's block. */
+int ios_fex_mono_take_pending(uint64_t* BlockBegin, uint64_t* HostPC, uint64_t* FaultAddr) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return 0;
+  }
+  const uint64_t Context = reinterpret_cast<uint64_t>(NtCurrentTeb()->ProcessEnvironmentBlock);
+  if (!Context) {
+    return 0;
+  }
+  for (uint32_t i = 0; i < IOS_MONO_MAX_CONTEXTS; i++) {
+    auto& P = B->pending[i];
+    if (__atomic_load_n(&P.context, __ATOMIC_ACQUIRE) != Context) {
+      continue;
+    }
+    uint32_t Want = 1;
+    if (!__atomic_compare_exchange_n(&P.state, &Want, 2, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+      return 0;  // empty, or already consumed
+    }
+    *BlockBegin = P.block_begin;
+    *HostPC = P.host_pc;
+    *FaultAddr = P.fault_addr;
+    return 1;
+  }
+  return 0;
+}
+
+/* One relaxed load. Keeps CompileBlock's added cost to a load+branch until the
+ * bridge is armed AND something is actually pending. */
+int ios_fex_mono_bridge_armed() {
+  auto* B = g_MonoBridge;
+  if (!B || !__atomic_load_n(&B->mono_base, __ATOMIC_ACQUIRE)) {
+    return 0;
+  }
+  return __atomic_load_n(&B->n_captured, __ATOMIC_RELAXED) != __atomic_load_n(&B->n_activated, __ATOMIC_RELAXED);
+}
+
+void ios_fex_mono_count_activated() {
+  if (g_MonoBridge) {
+    __atomic_add_fetch(&g_MonoBridge->n_activated, 1, __ATOMIC_RELAXED);
+  }
+}
+
+uint64_t ios_fex_mono_captured_count() {
+  return g_MonoBridge ? __atomic_load_n(&g_MonoBridge->n_captured, __ATOMIC_RELAXED) : 0;
+}
+
+/* Counters live with the table, off the caller's hot path. */
+void ios_fex_mono_count_helper(int Miss) {
+  auto* B = g_MonoBridge;
+  if (!B) {
+    return;
+  }
+  __atomic_add_fetch(&B->n_helper_calls, 1, __ATOMIC_RELAXED);
+  if (Miss) {
+    __atomic_add_fetch(&B->n_alias_miss, 1, __ATOMIC_RELAXED);
+  }
+}
+/* ========================== end ml648 MONO BRIDGE ========================= */
+
+/* ml990: recompute IosAliasJitSpan from the live table.
+ *
+ * Called only from BTCpu64IosAddAliasMapping (once per image load/unload), so
+ * this O(N) sweep is off every hot path.  Recomputing from scratch rather than
+ * widening incrementally is what lets the span SHRINK when images retire, and
+ * it is what makes the intersection test below exact rather than historical.
+ *
+ * The span is published with the size LAST and a barrier before it, matching
+ * the discipline the entries themselves use.  A reader that sees a new `lo'
+ * with an old `span' (or the reverse) can only get a wrong ANSWER to "is this
+ * already a pool address", and both wrong answers are benign: a false negative
+ * falls into the scan, which is the old path; a false positive is impossible,
+ * because the guard below has already established that no PeBase range
+ * intersects the span, so an address that would have matched the scan cannot
+ * be inside any lo..lo+span this function ever publishes. */
+static void MaintainJitSpan(int count) {
+  uint64_t lo = ~0ull, hi = 0;
+  int i;
+
+  if (!IosEcPoolFastOut) {
+    goto disable;
+  }
+  for (i = 0; i < count; i++) {
+    const uint64_t jb = g_Entries[i].JitBase;
+    const uint64_t sz = g_Entries[i].Size;
+    if (!sz) {
+      continue;
+    }
+    if (jb < lo) {
+      lo = jb;
+    }
+    if (jb + sz > hi) {
+      hi = jb + sz;
+    }
+  }
+  if (lo >= hi) {
+    goto disable;
+  }
+  /* THE GUARD. If any live PE range overlaps [lo, hi) then an address inside
+   * the span could also satisfy the scan, and skipping the scan would change
+   * the answer. Refuse the optimisation outright rather than reason about
+   * which of the two the caller meant. */
+  for (i = 0; i < count; i++) {
+    const uint64_t pb = g_Entries[i].PeBase;
+    const uint64_t sz = g_Entries[i].Size;
+    if (!sz) {
+      continue;
+    }
+    if (pb < hi && lo < pb + sz) {
+      goto disable;
+    }
+  }
+  IosAliasJitSpan[0] = lo;
+  __sync_synchronize();
+  IosAliasJitSpan[1] = hi - lo;
+  return;
+
+disable:
+  IosAliasJitSpan[1] = 0; /* size first: a zero span is never consulted again */
+  __sync_synchronize();
+  IosAliasJitSpan[0] = 0;
+}
+/* ========================= ml951 SUB-FLOOR WINDOWS =======================
+ *
+ * iOS reserves the low 4GB of every task, so a PE whose preferred base is below
+ * it cannot be mapped there (measured four ways -- see the ml938 block in
+ * ntdll-unix/signal_arm64_ios.c). Such an image is mapped high instead, and
+ * Wine's fault handler services data accesses to the vacated low range against
+ * the real mapping.
+ *
+ * That covers faults, but not QUESTIONS. FEX's QueryGuestExecutableRange asks
+ * the InvalidationTracker whether an address is executable; the tracker is
+ * built from actually-mapped sections, so a low address answers "no" and FEX
+ * refuses to build the entry block ("NoExec instruction in entry block"). No
+ * fault occurs, so there is nothing for the handler to service. This table
+ * lets that one lookup be answered.
+ *
+ * ⛔ DELIBERATELY SEPARATE FROM IosAliasEntries. Module.S's ExitFunctionEC
+ * translates branch targets PeBase -> JitBase through that table inline, so an
+ * entry there REWRITES CONTROL FLOW. Putting a sub-floor window in it would
+ * silently move the guest RIP to the high backing address, which is exactly
+ * what must not happen: the guest's address identity has to stay low. This
+ * table is query-only and Module.S never sees it.
+ *
+ * Registration reuses BTCpu64IosAddAliasMapping rather than adding an export,
+ * because a new export would need a PE-side binding and these are ARM64EC PE
+ * entry points -- NOT callable from native Mach-O code (ml613 armed such a
+ * call and crashed every launch). The discriminator is self-identifying and
+ * disjoint: a real JIT alias's PeBase is a mapped PE image base, which on iOS
+ * is always >= 4GB; a sub-floor window's low base is by definition < 4GB.
+ *
+ * ml2240: the task's floor sits a slide ABOVE 4GB, so an image based between
+ * 4GB and the floor (an old x64 linker's default 0x100000000) cannot be mapped
+ * there either. ntdll registers such a window only after proving the range is
+ * outside the task's map, and marks it with bit 63 (kIosSubfloorHighMark), which
+ * no PE base can carry. g_SubfloorCeiling is the end of the highest window.
+ */
+static constexpr uint64_t kIosSubfloorFloor = 0x100000000ull;
+static constexpr uint64_t kIosSubfloorHighMark = 1ull << 63;
+static constexpr int kMaxSubfloorEntries = 8;
+static uint64_t g_SubfloorCeiling = kIosSubfloorFloor;
+
+struct IosSubfloorEntry {
+  uint64_t LowBase;   // what the guest uses (below the floor)
+  uint64_t RealBase;  // where the image actually is
+  uint64_t Size;
+  uint64_t _Padding;
+};
+static IosSubfloorEntry g_Subfloor[kMaxSubfloorEntries];
+static int g_SubfloorCount;
+
+// low -> real, or Addr unchanged when it is not in a window.
+uint64_t IosSubfloorToReal(uint64_t Addr) {
+  if (Addr >= __atomic_load_n(&g_SubfloorCeiling, __ATOMIC_ACQUIRE)) {
+    return Addr; // fast reject: the overwhelmingly common case
+  }
+  const int count = g_SubfloorCount;
+  for (int i = 0; i < count; i++) {
+    const uint64_t lb = g_Subfloor[i].LowBase;
+    const uint64_t sz = g_Subfloor[i].Size;
+    if (sz && Addr >= lb && Addr < lb + sz) {
+      return g_Subfloor[i].RealBase + (Addr - lb);
+    }
+  }
+  return Addr;
+}
+
+// ml1057: is this guest RIP code that belongs to a sub-floor image -- either at the
+// image's real (high) mapping, which is where it executes, or named by its low
+// address? If so report the window so the JIT can translate that image's own
+// memory operands inline instead of faulting on each one.
+extern "C" int IosSubfloorWindowForCode(uint64_t Rip, uint64_t* Low, uint64_t* Size, uint64_t* Real) {
+  const int count = g_SubfloorCount;
+  for (int i = 0; i < count; i++) {
+    const uint64_t lb = g_Subfloor[i].LowBase, rb = g_Subfloor[i].RealBase, sz = g_Subfloor[i].Size;
+    if (!sz || !rb) continue;
+    if ((Rip >= rb && Rip < rb + sz) || (Rip >= lb && Rip < lb + sz)) {
+      static std::atomic<int> Said {0};
+      if (Said.fetch_add(1, std::memory_order_relaxed) < 4) {
+        LogMan::Msg::EFmt("[iOS-subfloor-xlate] ml1057 block at {:#x} lives in window [{:#x},+{:#x}) -> {:#x}: translating its "
+                          "memory operands inline", Rip, lb, sz, rb);
+      }
+      *Low = lb; *Size = sz; *Real = rb;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+// real -> low, or Addr unchanged. Used to map a tracker result back into the
+// guest's own address domain so the guest RIP is never moved high.
+uint64_t IosSubfloorToLow(uint64_t Addr) {
+  const int count = g_SubfloorCount;
+  for (int i = 0; i < count; i++) {
+    const uint64_t rb = g_Subfloor[i].RealBase;
+    const uint64_t sz = g_Subfloor[i].Size;
+    if (sz && Addr >= rb && Addr < rb + sz) {
+      return g_Subfloor[i].LowBase + (Addr - rb);
+    }
+  }
+  return Addr;
+}
+
+// ml1207: window Index as {low, real, size}; 0 past the end. The invalidation
+// tracker uses it to drop a sub-floor image's code under both of its names.
+int IosSubfloorEnum(int Index, uint64_t* Low, uint64_t* Real, uint64_t* Size) {
+  if (Index < 0 || Index >= g_SubfloorCount) {
+    return 0;
+  }
+  *Low = g_Subfloor[Index].LowBase;
+  *Real = g_Subfloor[Index].RealBase;
+  *Size = g_Subfloor[Index].Size;
+  return 1;
+}
+
+// Clip a range to the end of the window containing LowAddr, so a tracker range
+// can never be reported as extending past the window we actually back.
+uint64_t IosSubfloorClipSize(uint64_t LowAddr, uint64_t Size) {
+  const int count = g_SubfloorCount;
+  for (int i = 0; i < count; i++) {
+    const uint64_t lb = g_Subfloor[i].LowBase;
+    const uint64_t sz = g_Subfloor[i].Size;
+    if (sz && LowAddr >= lb && LowAddr < lb + sz) {
+      const uint64_t avail = (lb + sz) - LowAddr;
+      return Size < avail ? Size : avail;
+    }
+  }
+  return Size;
+}
+
+static void IosSubfloorRaiseCeiling(uint64_t LowBase, uint64_t Size) {
+  const uint64_t End = LowBase + Size;
+  if (End > LowBase && End > __atomic_load_n(&g_SubfloorCeiling, __ATOMIC_ACQUIRE)) {
+    __atomic_store_n(&g_SubfloorCeiling, End, __ATOMIC_RELEASE);
+  }
+}
+
+static bool IosSubfloorAdd(uint64_t LowBase, uint64_t RealBase, uint64_t Size) {
+  const int count = g_SubfloorCount;
+  IosSubfloorRaiseCeiling(LowBase, Size); // ml2240: before the entry is published
+  for (int i = 0; i < count; i++) {
+    if (g_Subfloor[i].LowBase == LowBase) {
+      // Re-registration: a second pseudo-process mapped the same image. Last
+      // writer wins, which is unsafe with two live loaders -- see the ml938
+      // note; ownership is owed before this is durable.
+      g_Subfloor[i].RealBase = RealBase;
+      __sync_synchronize();
+      g_Subfloor[i].Size = Size;
+      return true;
+    }
+  }
+  if (count >= kMaxSubfloorEntries) {
+    return false;
+  }
+  g_Subfloor[count].LowBase = LowBase;
+  g_Subfloor[count].RealBase = RealBase;
+  __sync_synchronize();
+  g_Subfloor[count].Size = Size; // published last
+  g_SubfloorCount = count + 1;
+  return true;
+}
+/* ======================= end ml951 SUB-FLOOR WINDOWS ===================== */
+
+void BTCpu64IosAddAliasMapping(uint64_t PeBase, uint64_t JitBase, uint64_t Size) {
+  /* ml951: a sub-floor window arrives through this same entry point, marked by
+   * a below-4GB "PeBase" (no real PE base can be there on iOS). Route it to the
+   * query-only table and return -- it must NEVER land in IosAliasEntries, which
+   * Module.S uses to rewrite branch targets. */
+  if (PeBase < kIosSubfloorFloor) {
+    IosSubfloorAdd(PeBase, JitBase, Size);
+    return;
+  }
+  /* ml2240: a window between 4GB and the task's floor, marked by ntdll. */
+  if (PeBase & kIosSubfloorHighMark) {
+    IosSubfloorAdd(PeBase & ~kIosSubfloorHighMark, JitBase, Size);
+    return;
+  }
+
+  int count = g_EntryCount;
+
+  // Identical re-registration: nothing to do.
+  for (int i = 0; i < count; i++) {
+    if (g_Entries[i].PeBase == PeBase && g_Entries[i].JitBase == JitBase && g_Entries[i].Size == Size) {
+      return;
+    }
+  }
+
+  WidenJitBounds(JitBase, Size);
+
+  // Retire every entry whose PE range overlaps the incoming image: a live
+  // image proves any overlapping entry is dead (two images cannot share a VA).
+  for (int i = 0; i < count; i++) {
+    const uint64_t pb = g_Entries[i].PeBase;
+    const uint64_t sz = g_Entries[i].Size;
+    const uint64_t jb = g_Entries[i].JitBase;
+    if (!sz) {
+      continue;
+    }
+    /* madeira-bcd: a reused JIT range retires the dead entry too
+     * (tools/patch-fex-ios-alias-retire-jit.py). */
+    if ((pb < PeBase + Size && PeBase < pb + sz) || (jb < JitBase + Size && JitBase < jb + sz)) {
+      g_Entries[i].Size = 0;
+      __sync_synchronize();
+    }
+  }
+
+  // Prefer a retired slot so long-running processes don't exhaust the table.
+  for (int i = 0; i < count; i++) {
+    if (!g_Entries[i].Size) {
+      g_Entries[i].PeBase = PeBase;
+      g_Entries[i].JitBase = JitBase;
+      __sync_synchronize();
+      g_Entries[i].Size = Size; // published last: readers see a complete entry
+      MaintainJitSpan(count);
+      return;
+    }
+  }
+
+  if (count >= kMaxEntries) {
+    /* ml1106: a silent refusal here means ExitFunctionEC never translates this
+     * image, so EVERY x64->EC call into it pays a Mach exec-fault redirect
+     * (ph-rdr59: 69k of every 100k redirects were one kernelbase export). */
+    /* madeira-bcd: no logging here -- this runs inside unix-side syscalls
+     * (ios_jit_add_mapping, the alias drain), and LogMan output is a nested
+     * unix call that corrupted the running syscall's frame (gta-2237:
+     * RockstarService died at pc == its syscall frame). Count only
+     * (tools/patch-fex-ios-alias-full-quiet.py). */
+    static uint64_t refused = 0;
+    __atomic_fetch_add(&refused, 1, __ATOMIC_RELAXED);
+    return;
+  }
+  g_Entries[count].PeBase = PeBase;
+  g_Entries[count].JitBase = JitBase;
+  g_Entries[count].Size = Size;
+  __sync_synchronize();
+  g_EntryCount = count + 1;
+  MaintainJitSpan(count + 1);
+}
+
+uint64_t IosJitTranslate(uint64_t Addr) {
+  int count = g_EntryCount;
+  for (int i = 0; i < count; i++) {
+    uint64_t pb = g_Entries[i].PeBase;
+    uint64_t sz = g_Entries[i].Size;
+    if (Addr >= pb && Addr < pb + sz) {
+      return g_Entries[i].JitBase + (Addr - pb);
+    }
+  }
+  return Addr;
+}
+
+uint64_t IosJitReverseTranslate(uint64_t Addr) {
+  if (Addr < __atomic_load_n(&g_JitLow, __ATOMIC_ACQUIRE) || Addr >= __atomic_load_n(&g_JitHigh, __ATOMIC_ACQUIRE)) {
+    return Addr;
+  }
+  int count = g_EntryCount;
+  for (int i = 0; i < count; i++) {
+    uint64_t jb = g_Entries[i].JitBase;
+    uint64_t sz = g_Entries[i].Size;
+    if (Addr >= jb && Addr < jb + sz) {
+      return g_Entries[i].PeBase + (Addr - jb);
+    }
+  }
+  return Addr;
+}
+
+}  // extern "C"
+
+#endif  // FEX_IOS_HOST

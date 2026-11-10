@@ -1,0 +1,128 @@
+{
+  "Features": {
+    "Bitness": 64,
+    "EnabledHostFeatures": [
+      "CRYPTO"
+    ],
+    "DisabledHostFeatures": [
+      "AFP",
+      "FLAGM",
+      "FLAGM2",
+      "SVE128",
+      "SVE256",
+      "I8MM",
+      "DOTPROD"
+    ],
+    "BinaryCacheVersion": 42
+  },
+  "Comment": [
+    "This file tracks the translations for the 'peephole' optimizations in FEX.",
+    "Peephole optimizations are small targetted optimizations that recognize",
+    "specific patterns in x86 code and specialize the translation accordingly."
+  ],
+  "Instructions": {
+    "vpcmpeqd + vpgatherdd": {
+      "x86InstructionCount": 2,
+      "ExpectedInstructionCount": 32,
+      "Comment": [
+        "Setting the mask to all-ones using vpcmpeqd, and then performing the gather operation.",
+        "This is an idiom emitted by Clang for an unmasked gather.",
+        "https://godbolt.org/z/4devEvfKf"
+      ],
+      "x86Insts": [
+        "vpcmpeqd ymm2, ymm2, ymm2",
+        "vpgatherdd ymm0, [ymm1*4 + rax], ymm2"
+      ],
+      "ExpectedArm64ASM": [
+        "ldr q2, [x28, #224]",
+        "cmeq v18.4s, v18.4s, v18.4s",
+        "cmeq v2.4s, v2.4s, v2.4s",
+        "ldr q3, [x28, #192]",
+        "ldr q4, [x28, #208]",
+        "smov x0, v17.s[0]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v16.s}[0], [x1]",
+        "smov x0, v17.s[1]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v16.s}[1], [x1]",
+        "smov x0, v17.s[2]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v16.s}[2], [x1]",
+        "smov x0, v17.s[3]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v16.s}[3], [x1]",
+        "smov x0, v4.s[0]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v3.s}[0], [x1]",
+        "smov x0, v4.s[1]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v3.s}[1], [x1]",
+        "smov x0, v4.s[2]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v3.s}[2], [x1]",
+        "smov x0, v4.s[3]",
+        "add x1, x4, w0, sxtw #2",
+        "ld1 {v3.s}[3], [x1]",
+        "movi v18.2d, #0x0",
+        "stp xzr, xzr, [x28, #224]",
+        "str q3, [x28, #192]"
+      ]
+    },
+    "sha256rnds2 + pshufd + sha256rnds2": {
+      "x86InstructionCount": 3,
+      "ExpectedInstructionCount": 13,
+      "Comment": [
+        "This idiom is used by OpenSSL and other crypto libraries, and can be translated more efficiently since the ARM64 SHA instructions do four rounds of SHA, not just two."
+      ],
+      "x86Insts": [
+        "sha256rnds2 xmm2, xmm1",
+        "pshufd xmm0, xmm0, 0xe",
+        "sha256rnds2 xmm1, xmm2"
+      ],
+      "ExpectedArm64ASM": [
+        "zip2 v2.2d, v17.2d, v18.2d",
+        "rev64 v2.4s, v2.4s",
+        "zip1 v3.2d, v17.2d, v18.2d",
+        "rev64 v3.4s, v3.4s",
+        "mov v4.16b, v2.16b",
+        "sha256h q4, q3, v16.4s",
+        "sha256h2 q3, q2, v16.4s",
+        "zip2 v2.2d, v3.2d, v4.2d",
+        "rev64 v18.4s, v2.4s",
+        "dup v2.4s, v16.s[0]",
+        "ext v16.16b, v16.16b, v2.16b, #8",
+        "zip1 v2.2d, v3.2d, v4.2d",
+        "rev64 v17.4s, v2.4s"
+      ]
+    },
+    "sha256rnds2 + psrldq + sha256rnds2": {
+      "x86InstructionCount": 4,
+      "ExpectedInstructionCount": 14,
+      "Comment": [
+        "The same as the pshufd form, with psrldq 8 and an unrelated instruction between."
+      ],
+      "x86Insts": [
+        "sha256rnds2 xmm2, xmm1",
+        "psrldq xmm0, 8",
+        "paddd xmm5, xmm7",
+        "sha256rnds2 xmm1, xmm2"
+      ],
+      "ExpectedArm64ASM": [
+        "zip2 v2.2d, v17.2d, v18.2d",
+        "rev64 v2.4s, v2.4s",
+        "zip1 v3.2d, v17.2d, v18.2d",
+        "rev64 v3.4s, v3.4s",
+        "mov v4.16b, v2.16b",
+        "sha256h q4, q3, v16.4s",
+        "sha256h2 q3, q2, v16.4s",
+        "zip2 v2.2d, v3.2d, v4.2d",
+        "rev64 v18.4s, v2.4s",
+        "movi v2.2d, #0x0",
+        "ext v16.16b, v16.16b, v2.16b, #8",
+        "add v21.4s, v21.4s, v23.4s",
+        "zip1 v2.2d, v3.2d, v4.2d",
+        "rev64 v17.4s, v2.4s"
+      ]
+    }
+  }
+}

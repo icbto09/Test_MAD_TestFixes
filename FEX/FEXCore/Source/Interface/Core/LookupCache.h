@@ -1,0 +1,671 @@
+// SPDX-License-Identifier: MIT
+#pragma once
+#include <atomic>
+#include <chrono>
+#include "Interface/Context/Context.h"
+#include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/SHMStats.h>
+#include <FEXCore/Utils/WritePriorityMutex.h>
+
+#include <FEXCore/fextl/map.h>
+#include <FEXCore/fextl/memory_resource.h>
+#include <FEXCore/fextl/robin_map.h>
+#include <FEXCore/fextl/robin_set.h>
+#include <FEXCore/fextl/vector.h>
+#include <FEXCore/fextl/memory_resource.h>
+
+#include <cstdint>
+#include <span>
+#include <stddef.h>
+#include <utility>
+#include <mutex>
+
+namespace FEXCore {
+struct LookupCacheBaseLockToken {
+protected:
+  // Protected constructor - only derived classes can construct
+  LookupCacheBaseLockToken() = default;
+};
+
+struct LookupCacheWriteLockToken : public LookupCacheBaseLockToken {
+private:
+  // Only constructible by GuestToHostMap
+  friend struct GuestToHostMap;
+  /* iOS-Madeira ml452 (#74): manual RAII instead of lock_guard so a token
+   * constructed while this thread ALREADY write-owns the mutex no-ops (the
+   * fault-handler re-entry chain: outer swap holds L'-write → nested compile
+   * → nested swap re-acquires — the write→write self-park that stalled
+   * ml449/ml451 runs).  Pairing is per-token: unlock iff this token locked. */
+  /* ml453: nested-aware acquire DISABLED — the ml452 grant let the nested
+   * emission reach its buffer-full branch, whose ClearCodeCache swap loops
+   * against the outer emission's state: 196k tail refusals + 65k AV retries
+   * in 2 minutes, phys to 4085MB (jetsam kill).  The self-park it replaced is
+   * the lesser harm until the re-entry path (ra=0x1369f718c, task #69) gets a
+   * nested-safe buffer-full strategy. */
+  LookupCacheWriteLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex)
+    : LockRef {Mutex}
+    , Locked {(Mutex.lock(), true)} {}
+  FEXCore::Utils::WritePriorityMutex::Mutex& LockRef;
+  bool Locked;
+
+public:
+  ~LookupCacheWriteLockToken() {
+    if (Locked) {
+      LockRef.unlock();
+    }
+  }
+  LookupCacheWriteLockToken(const LookupCacheWriteLockToken&) = delete;
+  LookupCacheWriteLockToken& operator=(const LookupCacheWriteLockToken&) = delete;
+};
+
+struct LookupCacheReadLockToken : public LookupCacheBaseLockToken {
+private:
+  // Only constructible by GuestToHostMap
+  friend struct GuestToHostMap;
+  LookupCacheReadLockToken(FEXCore::Utils::WritePriorityMutex::Mutex& Mutex)
+    : Lock {Mutex} {}
+  std::shared_lock<FEXCore::Utils::WritePriorityMutex::Mutex> Lock;
+};
+
+struct GuestToHostMap {
+  FEXCore::Utils::WritePriorityMutex::Mutex Lock {};
+
+  [[nodiscard]]
+  LookupCacheWriteLockToken AcquireWriteLock() {
+    return LookupCacheWriteLockToken {Lock};
+  }
+
+  [[nodiscard]]
+  LookupCacheReadLockToken AcquireReadLock() {
+    return LookupCacheReadLockToken {Lock};
+  }
+
+  struct BlockLinkTag {
+    uint64_t GuestDestination;
+    FEXCore::Context::ExitFunctionLinkData* HostLink;
+
+    bool operator<(const BlockLinkTag& other) const {
+      if (GuestDestination < other.GuestDestination) {
+        return true;
+      } else if (GuestDestination == other.GuestDestination) {
+        return HostLink < other.HostLink;
+      } else {
+        return false;
+      }
+    }
+  };
+
+  // Use a monotonic buffer resource to allocate both the std::pmr::map and its members.
+  // This allows us to quickly clear the block link map by clearing the monotonic allocator.
+  // If we had allocated the block link map without the MBR, then clearing the map would require slowly
+  // walking each block member and destructing objects.
+  //
+  // This makes `BlockLinks` look like a raw pointer that could memory leak, but since it is backed by the MBR, it won't.
+  fextl::pmr::named_monotonic_page_buffer_resource BlockLinks_mbr;
+  using BlockLinksMapType = std::pmr::map<BlockLinkTag, FEXCore::Context::BlockDelinkerFunc>;
+  fextl::unique_ptr<std::pmr::polymorphic_allocator<std::byte>> BlockLinks_pma;
+  BlockLinksMapType* BlockLinks;
+
+  struct BlockEntry {
+    uint64_t HostCode;
+    fextl::vector<uint64_t> CodePages;
+  };
+
+  fextl::robin_map<uint64_t, BlockEntry> BlockList;
+
+  fextl::map<uint64_t, fextl::vector<uint64_t>> CodePages;
+
+  GuestToHostMap();
+
+  // Adds to Guest -> Host code mapping
+  const BlockEntry& AddBlockMapping(uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode, const LookupCacheWriteLockToken&) {
+    // This may replace an existing mapping
+    // NOTE: Generally no previous entry should exist, however there is one exception:
+    //       If the backend updates the active thread's CodeBuffer, the new associated LookupCache
+    //       may already contain the block address. Since is comparatively rare, we'll just leak
+    //       one of the two blocks in this case.
+    return BlockList
+      .insert_or_assign(Address, BlockEntry {(uintptr_t)HostCode, fextl::vector<uint64_t>(CodePages.begin(), CodePages.end())})
+      .first->second;
+  }
+
+  const BlockEntry* FindBlock(uint64_t Address, const LookupCacheReadLockToken&) {
+    auto HostCode = BlockList.find(Address);
+    if (HostCode == BlockList.end()) {
+      return nullptr;
+    }
+    return &HostCode->second;
+  }
+
+  bool Erase(uint64_t Address, const LookupCacheWriteLockToken&) {
+    // Sever any links to this block
+    auto lower = BlockLinks->lower_bound({Address, nullptr});
+    auto upper = BlockLinks->upper_bound({Address, reinterpret_cast<FEXCore::Context::ExitFunctionLinkData*>(UINTPTR_MAX)});
+    for (auto it = lower; it != upper; it = BlockLinks->erase(it)) {
+      it->second(it->first.HostLink);
+    }
+
+    // Remove from BlockList
+    return BlockList.erase(Address) != 0;
+  }
+
+  void InvalidateRange(uint64_t Start, uint64_t Length) {
+    auto lk = AcquireWriteLock();
+
+    auto lower = CodePages.lower_bound(Start >> 12);
+    auto upper = CodePages.upper_bound((Start + Length - 1) >> 12);
+
+    for (auto it = lower; it != upper; it++) {
+      for (const auto& Entry : it->second) {
+        Erase(Entry, lk);
+      }
+    }
+    CodePages.erase(lower, upper);
+  }
+
+  void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
+                    const FEXCore::Context::BlockDelinkerFunc& delinker, const LookupCacheWriteLockToken&) {
+    BlockLinks->insert({{GuestDestination, HostLink}, delinker});
+  }
+
+  bool AddBlockExecutableRange(const std::ranges::input_range auto& Addresses, uint64_t Start, uint64_t Length, const LookupCacheWriteLockToken&) {
+    bool rv = false;
+
+    for (auto CurrentPage = Start >> 12, EndPage = (Start + Length - 1) >> 12; CurrentPage <= EndPage; CurrentPage++) {
+      auto& CodePage = CodePages[CurrentPage];
+      rv |= CodePage.empty();
+      CodePage.insert(CodePage.end(), Addresses.begin(), Addresses.end());
+    }
+
+    return rv;
+  }
+
+  void ClearCache(const LookupCacheWriteLockToken&);
+};
+
+class LookupCache {
+public:
+  struct LookupCacheEntry {
+    uintptr_t HostCode;
+    uintptr_t GuestCode;
+  };
+
+  /* MADEIRA ml920: L1 associativity.
+   *
+   * The L1 is the only lookup tier this configuration has -- DisableL2Cache is on, so
+   * Dispatcher.cpp emits `b(&NoBlock)` where the inline L2 walk would be and every L1 miss becomes
+   * a full C++ round trip (Spill/FillStaticRegs, a contended global counter, a shared read lock).
+   * Upstream's L1 is DIRECT-MAPPED on the low bits of the guest RIP, so once the live entry-point
+   * set is comparable to the entry count, misses stop being capacity misses and become conflict
+   * misses: two hot RIPs 0x20000 apart evict each other forever, however much cache is free.
+   * ml363 capped the array at 128K entries (2MB/thread) for footprint reasons across ~40 guest
+   * threads, so growing it is not available; associativity is, and it costs nothing extra:
+   * `L1_WAYS` ways of the SAME array, with a set index one bit shorter per doubling.
+   *
+   * The inline probe stays exactly as cheap on the way-0 hit (the common case: same instruction
+   * count, same registers); a way-0 miss pays one extra ldp/sub/cbnz/cbz before falling to the C++
+   * path it would have taken anyway. Insertion is a one-step demote, i.e. a FIFO of `L1_WAYS`.
+   *
+   * L1_WAYS == 1 reproduces upstream's direct-mapped cache byte-for-byte, in the emitted probe and
+   * in the C++ paths, and is what every non-iOS build gets.
+   */
+  // 2026-09-29: the ARM64EC module gets the 2-way cache too. It was left direct-mapped out of
+  // caution only; device statistics then showed x86-64 titles taking 77,000-105,000 L1 misses per
+  // second, 99% of them for blocks that already exist (l1_miss_l3hit), i.e. pure conflict misses,
+  // against 3,000-6,000/s for 32-bit titles on the 2-way cache. Both emitted probes
+  // (Dispatcher.cpp, BranchOps.cpp) are generic over L1_WAYS and the ARM64EC module has no probe
+  // of its own. Non-iOS builds keep the direct-mapped cache and byte-identical emitted code.
+#if defined(FEX_IOS_HOST)
+  constexpr static size_t L1_WAYS = 2;
+#else
+  constexpr static size_t L1_WAYS = 1;
+#endif
+  static_assert((L1_WAYS & (L1_WAYS - 1)) == 0, "L1_WAYS must be a power of two");
+  constexpr static size_t L1_SET_BYTES = L1_WAYS * sizeof(LookupCacheEntry);
+
+  LookupCache(FEXCore::Context::ContextImpl* CTX);
+  ~LookupCache();
+
+  // Swaps out the underlying GuestToHostMap and clears all associated caches.
+  // This interface requires the previous CodeBuffer to be provided despite not using it. This ensures the shared write lock is still valid.
+  void ChangeGuestToHostMapping([[maybe_unused]] CPU::CodeBuffer& Prev, GuestToHostMap& NewMap, const LookupCacheWriteLockToken& lk) {
+    ClearThreadLocalCaches(lk);
+    Shared = &NewMap;
+  }
+
+  uintptr_t FindBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address) {
+    // Try L1, no lock needed
+    auto* L1Set = GetL1Set(Address);
+    for (size_t Way = 0; Way < L1_WAYS; ++Way) {
+      if (L1Set[Way].GuestCode == Address) {
+        return L1Set[Way].HostCode;
+      }
+    }
+
+    // L2 and L3 need to be locked
+    uintptr_t HostPtr {};
+    {
+      std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
+        Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheReadLockTime : nullptr);
+      auto lk = Shared->AcquireReadLock();
+      LockTime.reset();
+
+      if (!DisableL2Cache()) {
+        // Try L2
+        const auto PageIndex = (Address & (VirtualMemSize - 1)) >> 12;
+        const auto PageOffset = Address & (0x0FFF);
+
+        const auto Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
+        auto LocalPagePointer = Pointers[PageIndex];
+
+        // Do we a page pointer for this address?
+        if (LocalPagePointer) {
+          // Find there pointer for the address in the blocks
+          auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+
+          if (BlockPointers[PageOffset].GuestCode == Address) {
+            HostPtr = BlockPointers[PageOffset].HostCode;
+            InsertL1(Address, HostPtr);
+          }
+        }
+      }
+
+      if (!HostPtr) {
+        // Try L3
+        auto Entry = Shared->FindBlock(Address, lk);
+        if (Entry) {
+          CacheBlockMapping(Address, *Entry, false, lk);
+          HostPtr = Entry->HostCode;
+        }
+      }
+    }
+
+    if (HostPtr && DynamicL1Cache()) {
+      UpdateDynamicL1Stats(Thread, Address, HostPtr);
+    }
+
+    FEXCORE_PROFILE_INSTANT_INCREMENT(Thread, AccumulatedCacheMissCount, 1);
+
+    return HostPtr;
+  }
+
+  void UpdateDynamicL1Stats(FEXCore::Core::InternalThreadState* Thread, uint64_t GuestAddress, uint64_t HostCode) {
+    // If host pointer was found in L2 or L3, then add it to the counter.
+    // Keeping track not L1 misses, but specifically L2/L3 hits.
+    ++L2L3CacheHits;
+#ifdef FEX_IOS_HOST
+    {   /* ml1124: process-wide L1-miss rate (every 2^20 misses, with the time) */
+      static std::atomic<uint64_t> IosL1Misses {0};
+      static std::atomic<int64_t> IosL1LastNs {0};
+      const uint64_t M = IosL1Misses.fetch_add(1, std::memory_order_relaxed) + 1;
+      if ((M & 0xfffff) == 0) {
+        const int64_t Now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t Last = IosL1LastNs.exchange(Now, std::memory_order_relaxed);
+        if (Last) LogMan::Msg::EFmt("[l1-miss] ml1124 {} L1 misses total, {:.0f}/s over the last 2^20", M, 1048576.0 * 1e9 / double(Now - Last));
+      }
+    }
+#endif
+
+#ifdef FEX_IOS_HOST
+    /* ml1059: this runs on EVERY L1 miss, and system_clock::now() is a call through a
+     * GetProcAddress'd kernelbase pointer. On iOS such a pointer names the image's
+     * non-executable backing, so each call is an exec fault -> Mach exception ->
+     * redirect to the pool copy: measured as the exception thread pinned at 32-54%
+     * CPU and the hottest guest threads stalling a kernel round trip per lookup miss
+     * (>= 1.38M redirects at this one pc in a 10-minute run). The heuristic only
+     * needs a coarse rate, so look at the clock once per 256 hits; the hit COUNT
+     * stays exact. */
+    if (L2L3CacheHits & 0xff) return;
+#endif
+    const auto CurrentTime = std::chrono::system_clock::now();
+    const auto Period = CurrentTime - LastPeriod;
+    if (Period >= SamplePeriod) {
+      // If larger than the sample period then check if we need to increase L1 cache size.
+      const double AveragePerSecond = static_cast<double>(L2L3CacheHits) /
+                                      static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(Period).count()) * 1000.0;
+
+      if (AveragePerSecond >= DynamicL1CacheIncreaseCountHeuristic()) {
+        if (CurrentL1Entries < MAX_L1_ENTRIES) {
+          // MADEIRA (upstream merge): upstream now drops the whole L1 here because entries whose
+          // address has the new mask bit set would be unreachable by InvalidateCache. The pin's
+          // InvalidateCache already walks every possible L1 size (dfcc61490), and on Windows
+          // VirtualDontNeed(.., false) decommits the pages the inline probe reads, so keep the
+          // old behaviour: just widen the mask.
+          CurrentL1Entries <<= 1;
+          L1PointerMask = CurrentL1Entries - 1;
+
+          // Update the thread's L1 pointer mask to increase how much cache it uses.
+          // Since we're in C-code, this is safe to update here.
+          Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+        }
+      } else if (AveragePerSecond < DynamicL1CacheDecreaseCountHeuristic()) {
+        if (CurrentL1Entries > MIN_L1_ENTRIES) {
+          CurrentL1Entries >>= 1;
+          L1PointerMask = CurrentL1Entries - 1;
+
+          // Madvise the entries that we are dropping. Gives the memory back to the OS.
+          LookupCacheEntry* FirstZeroL1Entry = &reinterpret_cast<LookupCacheEntry*>(L1Pointer)[CurrentL1Entries];
+          size_t ZeroMemorySize = (MAX_L1_ENTRIES - CurrentL1Entries) * sizeof(LookupCacheEntry);
+          FEXCore::Allocator::VirtualDontNeed(FirstZeroL1Entry, ZeroMemorySize, RecommitOnClear);
+
+          // Update the thread's L1 pointer mask to increase how much cache it uses.
+          // Since we're in C-code, this is safe to update here.
+          Thread->CurrentFrame->State.L1Mask = GetScaledL1PointerMask();
+        }
+      }
+
+      // Update Last period to start again.
+      LastPeriod = CurrentTime;
+      L2L3CacheHits = 0;
+    }
+  }
+
+  GuestToHostMap* Shared = nullptr;
+
+  // Appends a list of Block {Address} to CodePages [Start, Start + Length)
+  // Returns true if new pages are marked as containing code
+  bool AddBlockExecutableRange(FEXCore::Core::InternalThreadState* Thread, auto& Addresses, uint64_t Start, uint64_t Length) {
+    std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
+      Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
+    auto lk = Shared->AcquireWriteLock();
+    LockTime.reset();
+
+    return Shared->AddBlockExecutableRange(Addresses, Start, Length, lk);
+  }
+
+  // Adds to Guest -> Host code mapping
+  void AddBlockMapping(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, std::span<const uint64_t> CodePages, void* HostCode) {
+    std::optional<FEXCore::SHMStats::AccumulationBlock<uint64_t>> LockTime(
+      Thread->ThreadStats ? &Thread->ThreadStats->AccumulatedCacheWriteLockTime : nullptr);
+    auto lk = Shared->AcquireWriteLock();
+    LockTime.reset();
+
+    const auto& Entry = Shared->AddBlockMapping(Address, CodePages, HostCode, lk);
+
+    // There is no need to update L1 or L2, they will get updated on first lookup
+    // However, adding to L1 here increases performance
+    CacheBlockMapping(Address, Entry, true, lk);
+  }
+
+  // Invalidates L1/L2 for a given guest block
+  void InvalidateCache(uint64_t Address, const LookupCacheWriteLockToken& lk) {
+    // Do L1. MADEIRA ml920: every way of the set, not just one -- a stale copy left in a way this
+    // loop skipped is a live branch target for invalidated host code.
+#if defined(_WIN32)
+    // A dynamic L1 changes size, and an entry stays at the set the size of its time gave it: check
+    // the set under every size up to the current one. Missed, the entry came back to life when the
+    // cache returned to that size and sent the address to its old translation (HotSpot, rewriting
+    // code it runs, failed one launch in three). Entries past the current size were decommitted when
+    // the cache shrank.
+    for (size_t Entries = DynamicL1Cache() ? MIN_L1_ENTRIES : L1PointerMask + 1; Entries <= L1PointerMask + 1; Entries <<= 1) {
+      const size_t SetMask = (Entries / L1_WAYS) - 1;
+      auto* L1Set = reinterpret_cast<LookupCacheEntry*>(L1Pointer + ((Address & SetMask) * L1_SET_BYTES));
+#else
+    {
+      auto* L1Set = GetL1Set(Address);
+#endif
+      for (size_t Way = 0; Way < L1_WAYS; ++Way) {
+        if (L1Set[Way].GuestCode == Address) {
+          L1Set[Way].GuestCode = 0;
+          // Leave HostCode as is, so that concurrent lookups won't read a null pointer
+          // This is a soft guarantee for cross thread invalidation, as atomics are not used
+          // and it hasn't been thoroughly tested
+        }
+      }
+    }
+
+    if (!DisableL2Cache()) {
+      // Do full map
+      Address = Address & (VirtualMemSize - 1);
+      uint64_t PageOffset = Address & (0x0FFF);
+      Address >>= 12;
+
+      uintptr_t* Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
+      uint64_t LocalPagePointer = Pointers[Address];
+      if (!LocalPagePointer) {
+        // Page for this code didn't even exist, nothing to do
+        return;
+      }
+
+      // Page exists, just set the offset to zero
+      auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+      BlockPointers[PageOffset].GuestCode = 0;
+      BlockPointers[PageOffset].HostCode = 0;
+    }
+  }
+
+  // Invalidates all L1/L2 entries for all guest block that intersect the given range
+  bool InvalidateCacheRange(uint64_t Start, uint64_t Length) {
+    auto lk = Shared->AcquireWriteLock();
+
+    auto lower = CachedCodePages.lower_bound(Start >> 12);
+    auto upper = CachedCodePages.upper_bound((Start + Length - 1) >> 12);
+
+    for (auto it = lower; it != upper; it++) {
+      for (const auto& Entry : it->second) {
+        InvalidateCache(Entry, lk);
+      }
+    }
+    bool ret = upper != lower;
+    CachedCodePages.erase(lower, upper);
+    return ret;
+  }
+
+  void AddBlockLink(uint64_t GuestDestination, FEXCore::Context::ExitFunctionLinkData* HostLink,
+                    const FEXCore::Context::BlockDelinkerFunc& delinker, const LookupCacheWriteLockToken& lk) {
+    Shared->AddBlockLink(GuestDestination, HostLink, delinker, lk);
+  }
+
+  void ClearCache(const LookupCacheWriteLockToken&);
+  void ClearL2Cache(const LookupCacheBaseLockToken&);
+  void ClearThreadLocalCaches(const LookupCacheWriteLockToken&);
+
+  uintptr_t GetL1Pointer() const {
+    return L1Pointer;
+  }
+  /* MADEIRA ml920: the value the JIT's inline probe ANDs the shifted RIP with. It selects a SET,
+   * pre-scaled to a byte offset, so with L1_WAYS == 1 it is exactly upstream's
+   * `(Entries - 1) << ilog2(entry)` and the emitted probe is unchanged. L1PointerMask is always
+   * `Entries - 1` with Entries a power of two, so shifting it right by log2(ways) is `Sets - 1`. */
+  uintptr_t GetScaledL1PointerMask() const {
+    return L1SetMask() << FEXCore::ilog2(LookupCache::L1_SET_BYTES);
+  }
+  uintptr_t GetPagePointer() const {
+    // ml606: publish NULL when there is no L2 region. The JIT never loads
+    // Pointers.L2Pointer in this mode (Dispatcher.cpp:279), so a null here is
+    // inert — and if anything ever does dereference it, it faults at 0 rather
+    // than wandering into whatever now lives at the old address.
+    return L2Enabled ? PagePointer : 0;
+  }
+  uintptr_t GetVirtualMemorySize() const {
+    return VirtualMemSize;
+  }
+
+  // This needs to be taken before reads or writes to L2, L3, CodePages,
+  // and before writes to L1. Concurrent access from a thread that this LookupCache doesn't belong to
+  // may only happen during cross thread invalidation (::Erase).
+  // All other operations must be done from the owning thread.
+  // Some care is taken so that L1 lookups can be done without locks, and even tearing is unlikely to lead to a crash.
+  // This approach has not been fully vetted yet.
+  // Also note that L1 lookups might be inlined in the JIT Dispatcher and/or block ends.
+  auto AcquireWriteLock() {
+    return Shared->AcquireWriteLock();
+  }
+
+private:
+  // MADEIRA ml920: set index, in entries-1 form.
+  uint64_t L1SetMask() const {
+    return L1PointerMask >> FEXCore::ilog2(LookupCache::L1_WAYS);
+  }
+
+  // Way 0 of the set `Address` maps to. Ways of a set are contiguous, so one ldp per way.
+  LookupCacheEntry* GetL1Set(uint64_t Address) const {
+    return reinterpret_cast<LookupCacheEntry*>(L1Pointer + ((Address & L1SetMask()) * L1_SET_BYTES));
+  }
+
+  /* MADEIRA ml920: publish a block into the set's way 0, demoting what was there by one way. That
+   * makes a set a FIFO of L1_WAYS rather than a direct-mapped slot with dead neighbours, which is
+   * the entire point of the associativity. With L1_WAYS == 1 the loop is empty and this is
+   * upstream's two stores, in upstream's order.
+   *
+   * Locking: demoting an entry to another way is the one L1 write that could RESURRECT a mapping a
+   * concurrent InvalidateCache had just cleared (it could copy a pre-invalidation way 0 into a way
+   * the invalidator has already scanned). Both callers hold a LookupCache lock -- AddBlockMapping
+   * the write lock, FindBlock the read lock -- and InvalidateCache requires the write lock, so the
+   * two can never overlap. Do not call this without one.
+   *
+   * Reads are unlocked but owner-thread-only (the JIT's inline probe and FindBlock both run on the
+   * thread that owns this cache), so the non-atomic 16-byte copy below cannot be observed torn; the
+   * only cross-thread writer is InvalidateCache, which just zeroes GuestCode. */
+  void InsertL1(uint64_t Address, uintptr_t HostCode) {
+    auto* Set = GetL1Set(Address);
+    for (size_t Way = L1_WAYS - 1; Way > 0; --Way) {
+      Set[Way] = Set[Way - 1];
+    }
+    Set[0].GuestCode = Address;
+    Set[0].HostCode = HostCode;
+  }
+
+  void CacheBlockMapping(uint64_t Address, const GuestToHostMap::BlockEntry& Entry, bool L1Only, const LookupCacheBaseLockToken& lk) {
+    for (const auto& CodePage : Entry.CodePages) {
+      CachedCodePages[CodePage >> 12].insert(Address);
+    }
+
+    // Do L1
+    InsertL1(Address, Entry.HostCode);
+
+    if (!DisableL2Cache() && !L1Only) {
+      // Do ful map
+      auto FullAddress = Address;
+      Address = Address & (VirtualMemSize - 1);
+
+      uint64_t PageOffset = Address & (0x0FFF);
+      Address >>= 12;
+
+      uintptr_t* Pointers = reinterpret_cast<uintptr_t*>(PagePointer);
+      uint64_t LocalPagePointer = Pointers[Address];
+      if (!LocalPagePointer) {
+        // We don't have a page pointer for this address
+        // Allocate one now if we can
+        uintptr_t NewPageBacking = AllocateBackingForPage();
+        if (!NewPageBacking) {
+          // Couldn't allocate, clear L2 and retry
+          ClearL2Cache(lk);
+          CacheBlockMapping(FullAddress, Entry, false, lk);
+          return;
+        }
+        Pointers[Address] = NewPageBacking;
+        LocalPagePointer = NewPageBacking;
+      }
+
+      // Add the new pointer to the page block
+      auto BlockPointers = reinterpret_cast<LookupCacheEntry*>(LocalPagePointer);
+
+      // This silently replaces existing mappings
+      BlockPointers[PageOffset].GuestCode = FullAddress;
+      BlockPointers[PageOffset].HostCode = Entry.HostCode;
+    }
+  }
+
+  uintptr_t AllocateBackingForPage() {
+    uintptr_t NewBase = AllocateOffset;
+    uintptr_t NewEnd = AllocateOffset + SIZE_PER_PAGE;
+
+    if (NewEnd >= CODE_SIZE) {
+      // We ran out of block backing space. Need to clear the block cache and tell the JIT cores to clear their caches as well
+      // Tell whatever is calling this that it needs to do it.
+      return 0;
+    }
+
+    AllocateOffset = NewEnd;
+    return PageMemory + NewBase;
+  }
+
+  // Maps from a page index to all blocks in the page that have at some point been fetched into L1/L2
+  fextl::map<uint64_t, fextl::robin_set<uint64_t>> CachedCodePages;
+
+  uintptr_t PagePointer;
+  uintptr_t PageMemory;
+  uintptr_t L1Pointer;
+  uintptr_t L1PointerMask;
+
+  size_t TotalCacheSize;
+
+  // iOS-Madeira ml606: L1-ONLY LAYOUT when the L2 cache is disabled.
+  //
+  // The full layout is [L2 page table][CODE_SIZE arena][L1] contiguous — on iOS
+  // 16MB + 32MB + 2MB = 50MB per guest thread, and FEX_IOS_HOST COMMITS it all
+  // up front (the auto-commit-on-AV path doesn't work here). DisableL2Cache
+  // defaults to TRUE and Dispatcher.cpp:279 emits `b(&NoBlock)` instead of any
+  // L2 lookup when it is set, so on the shipping config those 48MB per thread
+  // were allocated, committed and scrubbed but never read. ml605 had ~100 live
+  // caches when it was jetsam-killed at 4080/4096MB with fex=1234MB dirty.
+  //
+  // L2Enabled is snapshotted ONCE here. Do not re-consult the config later:
+  // Dispatcher and each LookupCache would otherwise sample it independently and
+  // could disagree, which would emit an L2 lookup against an L1-only allocation.
+  //
+  // AllocationBase/AllocationSize describe what was ACTUALLY mapped, so the
+  // destructor and the clear paths stay correct in both layouts rather than
+  // operating on PagePointer/TotalCacheSize which only describe the full one.
+  bool L2Enabled;
+  // iOS eagerly commits lookup storage: keep Wine's page state consistent
+  // after a discard, including the inactive tail of a dynamic L1 cache.
+  bool RecommitOnClear {false};
+  uintptr_t AllocationBase;
+  size_t AllocationSize;
+
+  // Start with 8k entries in L1 to give 128KB of L1 cache to each thread.
+  // Max out at 1 million entries to give each thread 16MB of L1 cache maximum.
+  constexpr static size_t MIN_L1_ENTRIES = 8 * 1024;        // Must be a power of 2
+#ifdef FEX_IOS_HOST
+  /* iOS-Madeira ml363: cap the dynamic-L1 growth ceiling at 128K entries (2MB)
+   * instead of 1M (16MB). A hot thread's L1 inserts hash-scatter across the
+   * whole array, so a few thousand cached blocks dirty nearly every 16KB page
+   * of whatever the ceiling allows — ml362 [phys-map] measured ~29MB dirty
+   * per thread cache with ~40 guest threads ≈ 1GB against the 4096MB jetsam
+   * limit, even with construction memsets removed (zero-scrub stale=0 on all
+   * 42 threads). 2MB bounds that at ~80MB fleet-wide; hot threads fall back
+   * to L2 more often (hit rate was 77% at the 8K MINIMUM, so the ceiling cut
+   * is expected to cost little). Also shrinks each per-thread allocation by
+   * 14MB ([TI-IC] lookupcache-alloc size drops 0x6000000 → 0x5200000, which
+   * doubles as the deploy marker). */
+  constexpr static size_t MAX_L1_ENTRIES = 128 * 1024; // Must be a power of 2
+#else
+  constexpr static size_t MAX_L1_ENTRIES = 1 * 1024 * 1024; // Must be a power of 2
+#endif
+
+#ifdef FEX_IOS_HOST
+  /* iOS-Madeira: halve the per-thread block-backing arena — it's committed
+   * upfront on iOS (see LookupCache.cpp) and 128MB × ~19 threads was OOM-ing
+   * the process. 64MB still backs 1024 guest code pages per thread; on
+   * overflow AllocateBackingForPage returns 0 → clean ClearCodeCache.
+   *
+   * ml387: halved again 64→32MB — VA, not footprint, is now the wall: the
+   * guest band hit 38MB free with ~50 live lookupcaches at 82MB each
+   * (0x5200000). 32MB still backs 512 guest code pages per thread; overflow
+   * remains a clean ClearCodeCache. New [TI-IC] lookupcache-alloc marker:
+   * 0x3200000. */
+  constexpr static size_t CODE_SIZE = 32 * 1024 * 1024;
+#else
+  constexpr static size_t CODE_SIZE = 128 * 1024 * 1024;
+#endif
+  constexpr static size_t SIZE_PER_PAGE = FEXCore::Utils::FEX_PAGE_SIZE * sizeof(LookupCacheEntry);
+  constexpr static size_t MAX_L1_SIZE = MAX_L1_ENTRIES * sizeof(LookupCacheEntry);
+
+  size_t AllocateOffset {};
+
+  FEXCore::Context::ContextImpl* ctx;
+  uint64_t VirtualMemSize {};
+
+  size_t CurrentL1Entries = MIN_L1_ENTRIES;
+  uint64_t L2L3CacheHits {};
+  std::chrono::time_point<std::chrono::system_clock> LastPeriod {};
+  constexpr static std::chrono::seconds SamplePeriod {1};
+  FEX_CONFIG_OPT(DynamicL1CacheIncreaseCountHeuristic, DYNAMICL1CACHEINCREASECOUNTHEURISTIC);
+  FEX_CONFIG_OPT(DynamicL1CacheDecreaseCountHeuristic, DYNAMICL1CACHEDECREASECOUNTHEURISTIC);
+
+  FEX_CONFIG_OPT(DynamicL1Cache, DYNAMICL1CACHE);
+  FEX_CONFIG_OPT(DisableL2Cache, DISABLEL2CACHE);
+};
+} // namespace FEXCore

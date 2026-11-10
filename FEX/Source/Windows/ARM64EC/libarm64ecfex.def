@@ -1,0 +1,29 @@
+LIBRARY libarm64ecfex.dll
+
+EXPORTS
+  BTCpu64FlushInstructionCache
+  BTCpu64IosReleaseThreadHolds
+  BTCpu64IsProcessorFeaturePresent
+  BTCpu64NotifyMemoryDirty
+  BTCpu64NotifyReadFile
+  DispatchJump DATA
+  RetToEntryThunk DATA
+  ExitToX64 DATA
+  BeginSimulation DATA
+  FlushInstructionCacheHeavy
+  NotifyImageMap
+  NotifyMapViewOfSection
+  NotifyMemoryAlloc
+  NotifyMemoryFree
+  NotifyMemoryProtect
+  NotifyUnmapViewOfSection
+  ProcessInit
+  ProcessTerm
+  ResetToConsistentState
+  ThreadInit
+  ThreadTerm
+  UpdateProcessorInformation
+
+; MADEIRA: an iOS-host build links libarm64ecfex_ios.def instead, which repeats this list and adds the
+; exports whose symbols only exist under FEX_IOS_HOST (a DEF entry for a symbol that does not exist is
+; a link error). Keep the shared entries in step.

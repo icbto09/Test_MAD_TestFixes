@@ -1,0 +1,79 @@
+# Inspired by LLVM's pr-code-format.yml at
+# https://github.com/llvm/llvm-project/blob/main/.github/workflows/pr-code-format.yml
+
+name: Check code formatting
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  code_formatter:
+    runs-on: [self-hosted, X64]
+    if: github.repository == 'FEX-Emu/FEX'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Checkout through merge base
+        uses: rmacklin/fetch-through-merge-base@v0
+        timeout-minutes: 3
+        with:
+          base_ref: ${{ github.event.pull_request.base.ref }}
+          head_ref: ${{ github.event.pull_request.head.sha }}
+          deepen_length: 500
+
+      - name: Get changed files
+        run: |
+          BASE=$(git merge-base main HEAD)
+          FILES=$(git diff --name-only "$BASE" | tr '\n' ',' | sed 's/,$//')
+          echo "CHANGED_FILES=$FILES" >> $GITHUB_ENV
+
+          echo "Changed files:"
+          echo "$FILES"
+
+      - name: Check git-clang-format-19 exists
+        run: which git-clang-format-19
+
+      - name: Setup Python env
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.11
+          cache: pip
+          cache-dependency-path: ./External/code-format-helper/requirements_formatting.txt
+
+      - name: Install python dependencies
+        run: pip install -r ./External/code-format-helper/requirements_formatting.txt
+
+      - name: Run code formatter
+        env:
+          CLANG_FORMAT_PATH: git-clang-format-19
+          GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+          START_REV: ${{ github.event.pull_request.base.sha }}
+          END_REV: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python ./External/code-format-helper/code-format-helper.py \
+            --repo "FEX-Emu/FEX" \
+            --issue-number "$GITHUB_PR_NUMBER" \
+            --start-rev "$START_REV" \
+            --end-rev "$END_REV" \
+            --changed-files "$CHANGED_FILES"
+
+      - name: Check long CMake lines
+        if: always()
+        run: |
+          # check lines > 140 chars
+          # unit tests are left alone for now
+          # FEXInterpreter is also left alone until its long echo lines can be removed
+          echo "$CHANGED_FILES" | tr ',' '\n' | grep -ve "unittests\|External\|FEXInterpreter" \
+            | grep -e "CMakeLists.txt\|\.cmake" | xargs -L1 wc -L | while read -r line; do
+            if [ "$(echo "$line" | cut -d' ' -f1)" -gt 140 ]; then
+              echo "$line"
+            fi
+          done | tee lines.txt
+
+          # if any lines were emitted, fail
+          [ ! -s lines.txt ]
