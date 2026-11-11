@@ -1,0 +1,136 @@
+Madeira: survive a null graphics pipeline bind.
+
+vkCreateGraphicsPipelines returns VK_NULL_HANDLE for a pipeline whose Metal state fails to
+compile. Detroit: Become Human binds that handle anyway; MoltenVK dereferenced it in
+vkCmdBindPipeline and crashed. A null bind is now recorded on the command encoder and draws
+are skipped until a real pipeline is bound. Always on. The log shows
+"[mvk-madeira] null graphics pipeline bound" with a running count.
+
+Applies on top of 0001 and 0002 (MoltenVK v1.4.2).
+
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+index 664276b..19c6a3f 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdDraw.mm
+@@ -172,6 +172,7 @@ void MVKCmdDraw::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
+ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
+ 
+ 	if (_vertexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
++	if (cmdEncoder->_madeiraNullGraphicsPipelineBound) { return; }	// Madeira: null pipeline bound.
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -445,6 +446,7 @@ static const MVKMTLBufferAllocation* convertUint8IndexBuffer(MVKCommandEncoder*
+ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
+ 
+ 	if (_indexCount == 0 || _instanceCount == 0) { return; }	// Nothing to do.
++	if (cmdEncoder->_madeiraNullGraphicsPipelineBound) { return; }	// Madeira: null pipeline bound.
+ 
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+@@ -721,6 +723,8 @@ void MVKCmdDrawIndirect::encodeIndexedIndirect(MVKCommandEncoder* cmdEncoder) {
+ 
+ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+ 
++	if (cmdEncoder->_madeiraNullGraphicsPipelineBound) { return; }	// Madeira: null pipeline bound.
++
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 
+ 	auto* pipeline = cmdEncoder->getGraphicsPipeline();
+@@ -1025,12 +1029,16 @@ VkResult MVKCmdDrawIndexedIndirect::setContent(MVKCommandBuffer* cmdBuff,
+ }
+ 
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder) {
++	if (cmdEncoder->_madeiraNullGraphicsPipelineBound) { return; }	// Madeira: null pipeline bound.
++
+ 	cmdEncoder->restartMetalRenderPassIfNeeded();
+ 	encode(cmdEncoder, cmdEncoder->getVkGraphics()._indexBuffer);
+ }
+ 
+ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKIndexMTLBufferBinding& ibbOrig) {
+ 
++	if (cmdEncoder->_madeiraNullGraphicsPipelineBound) { return; }	// Madeira: null pipeline bound.
++
+     cmdEncoder->_isIndexedDraw = true;
+ 
+     MVKIndexMTLBufferBinding ibb = ibbOrig;
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+index 9092954..8282c92 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCmdPipeline.mm
+@@ -24,6 +24,8 @@
+ #include "MVKPipeline.h"
+ #include "MVKFoundation.h"
+ #include "mvk_datatypes.hpp"
++#include <atomic>
++#include <cstdio>
+ 
+ 
+ #pragma mark -
+@@ -249,12 +251,28 @@ VkResult MVKCmdBindPipeline::setContent(MVKCommandBuffer* cmdBuff, VkPipeline pi
+ #pragma mark -
+ #pragma mark MVKCmdBindGraphicsPipeline
+ 
++// Madeira: a game can bind VK_NULL_HANDLE, the handle vkCreateGraphicsPipelines returns for a
++// pipeline that failed to compile (Detroit: Become Human does). MoltenVK dereferenced it and
++// crashed. A null bind is now recorded, and draws are skipped until a real pipeline is bound,
++// which is what MoltenVK already does for a pipeline whose Metal state could not be compiled.
++static std::atomic<uint64_t> sMadeiraNullPipelineBinds(0);
++
+ void MVKCmdBindGraphicsPipeline::encode(MVKCommandEncoder* cmdEncoder) {
++	if ( !_pipeline ) {
++		cmdEncoder->_madeiraNullGraphicsPipelineBound = true;
++		uint64_t n = ++sMadeiraNullPipelineBinds;
++		if (n == 1 || n % 1000 == 0) {
++			fprintf(stderr, "[mvk-madeira] null graphics pipeline bound; its draws are skipped (%llu so far)\n",
++					(unsigned long long)n);
++		}
++		return;
++	}
++	cmdEncoder->_madeiraNullGraphicsPipelineBound = false;
+ 	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, _pipeline);
+ }
+ 
+ bool MVKCmdBindGraphicsPipeline::isTessellationPipeline() {
+-	return ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
++	return _pipeline && ((MVKGraphicsPipeline*)_pipeline)->isTessellationPipeline();
+ }
+ 
+ 
+@@ -262,6 +280,7 @@ bool MVKCmdBindGraphicsPipeline::isTessellationPipeline() {
+ #pragma mark MVKCmdBindComputePipeline
+ 
+ void MVKCmdBindComputePipeline::encode(MVKCommandEncoder* cmdEncoder) {
++	if ( !_pipeline ) { return; }	// Madeira: a failed pipeline's null handle; keep what was bound.
+ 	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, _pipeline);
+ }
+ 
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+index 76ca788..3646b6d 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.h
+@@ -508,6 +508,12 @@ public:
+ 	/** Indicates whether the current draw is an indexed draw. */
+ 	bool _isIndexedDraw;
+ 
++	/**
++	 * Madeira: set while the game has bound a null graphics pipeline, which is what a game
++	 * holds for a pipeline whose creation failed. Draws are skipped until a real one is bound.
++	 */
++	bool _madeiraNullGraphicsPipelineBound = false;
++
+ #pragma mark Construction
+ 
+ 	MVKCommandEncoder(MVKCommandBuffer* cmdBuffer,
+diff --git a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+index 8c24deb..c296f3b 100644
+--- a/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
++++ b/MoltenVK/MoltenVK/Commands/MVKCommandBuffer.mm
+@@ -429,6 +429,7 @@ void MVKCommandEncoder::beginEncoding(id<MTLCommandBuffer> mtlCmdBuff, MVKComman
+     _renderSubpassIndex = 0;
+     _multiviewPassIndex = 0;
+     _canUseLayeredRendering = false;
++    _madeiraNullGraphicsPipelineBound = false;
+ 
+     _mtlCmdBuffer = mtlCmdBuff;        // not retained
+ 

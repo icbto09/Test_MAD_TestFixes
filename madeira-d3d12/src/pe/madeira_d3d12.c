@@ -21239,6 +21239,388 @@ static HRESULT STDMETHODCALLTYPE rootsig_GetDevice(ID3D12RootSignature *This, RE
     (void)This; return mad_child_get_device(NULL, riid, out);
 }
 
+/* ---- device call log (fork diagnostic) -----------------------------------
+ * env.MADEIRA_D3D12_CALL_LOG in the game config. Unset or 0: off, nothing is installed.
+ * 1: every ID3D12Device call that returns a failure, and the first call of each method.
+ * 2: every call as well (methods a game calls every frame are still failures-only).
+ * One line each: "[d3d12-call] #<n> tid=<thread> Device::<method> -> 0x<HRESULT>", in call
+ * order across threads, so the last lines before a crash show what the game had just asked
+ * for and what it was told. QueryInterface and CheckFeatureSupport have logs of their own
+ * ("[d3d12-caps]"). Signatures are those of madeira_d3d12_stubs.h. */
+static ID3D12Device10Vtbl g_calllog_orig;
+static int g_calllog_level;
+static LONG g_calllog_seq, g_calllog_lines, g_calllog_fail_lines;
+enum {
+    CALLLOG_CreateCommandQueue,
+    CALLLOG_CreateCommandAllocator,
+    CALLLOG_CreateGraphicsPipelineState,
+    CALLLOG_CreateComputePipelineState,
+    CALLLOG_CreateCommandList,
+    CALLLOG_CreateDescriptorHeap,
+    CALLLOG_CreateRootSignature,
+    CALLLOG_CreateCommittedResource,
+    CALLLOG_CreateHeap,
+    CALLLOG_CreatePlacedResource,
+    CALLLOG_CreateReservedResource,
+    CALLLOG_CreateSharedHandle,
+    CALLLOG_OpenSharedHandle,
+    CALLLOG_OpenSharedHandleByName,
+    CALLLOG_MakeResident,
+    CALLLOG_Evict,
+    CALLLOG_CreateFence,
+    CALLLOG_GetDeviceRemovedReason,
+    CALLLOG_CreateQueryHeap,
+    CALLLOG_SetStablePowerState,
+    CALLLOG_CreateCommandSignature,
+    CALLLOG_CreatePipelineLibrary,
+    CALLLOG_SetEventOnMultipleFenceCompletion,
+    CALLLOG_SetResidencyPriority,
+    CALLLOG_CreatePipelineState,
+    CALLLOG_OpenExistingHeapFromAddress,
+    CALLLOG_OpenExistingHeapFromFileMapping,
+    CALLLOG_EnqueueMakeResident,
+    CALLLOG_CreateCommandList1,
+    CALLLOG_CreateProtectedResourceSession,
+    CALLLOG_CreateCommittedResource1,
+    CALLLOG_CreateHeap1,
+    CALLLOG_CreateReservedResource1,
+    CALLLOG_CreateLifetimeTracker,
+    CALLLOG_EnumerateMetaCommands,
+    CALLLOG_EnumerateMetaCommandParameters,
+    CALLLOG_CreateMetaCommand,
+    CALLLOG_CreateStateObject,
+    CALLLOG_SetBackgroundProcessingMode,
+    CALLLOG_AddToStateObject,
+    CALLLOG_CreateProtectedResourceSession1,
+    CALLLOG_CreateCommittedResource2,
+    CALLLOG_CreatePlacedResource1,
+    CALLLOG_CreateShaderCacheSession,
+    CALLLOG_ShaderCacheControl,
+    CALLLOG_CreateCommandQueue1,
+    CALLLOG_CreateCommittedResource3,
+    CALLLOG_CreatePlacedResource2,
+    CALLLOG_CreateReservedResource2,
+    CALLLOG_COUNT
+};
+static LONG g_calllog_calls[CALLLOG_COUNT];
+static void mad_calllog_note(int idx, const char *method, HRESULT hr, int quiet) {
+    LONG seq = InterlockedIncrement(&g_calllog_seq);
+    LONG nth = InterlockedIncrement(&g_calllog_calls[idx]);
+    if (FAILED(hr)) {
+        if (InterlockedIncrement(&g_calllog_fail_lines) > 2000) return;
+        d3d12_log("[d3d12-call] #%ld tid=%04lx Device::%s -> 0x%08lx FAILED (call %ld of this method)\n",
+                  (long)seq, (unsigned long)GetCurrentThreadId(), method, (unsigned long)hr, (long)nth);
+        return;
+    }
+    if (nth != 1 && (g_calllog_level < 2 || quiet)) return;
+    if (InterlockedIncrement(&g_calllog_lines) > 20000) return;
+    d3d12_log("[d3d12-call] #%ld tid=%04lx Device::%s -> 0x%08lx%s\n",
+              (long)seq, (unsigned long)GetCurrentThreadId(), method, (unsigned long)hr, nth == 1 ? " (first call)" : "");
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommandQueue(ID3D12Device10 *This, const D3D12_COMMAND_QUEUE_DESC *desc, REFIID riid, void **command_queue) {
+    HRESULT hr = g_calllog_orig.CreateCommandQueue(This, desc, riid, command_queue);
+    mad_calllog_note(CALLLOG_CreateCommandQueue, "CreateCommandQueue", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommandAllocator(ID3D12Device10 *This, D3D12_COMMAND_LIST_TYPE type, REFIID riid, void **command_allocator) {
+    HRESULT hr = g_calllog_orig.CreateCommandAllocator(This, type, riid, command_allocator);
+    mad_calllog_note(CALLLOG_CreateCommandAllocator, "CreateCommandAllocator", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateGraphicsPipelineState(ID3D12Device10 *This, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state) {
+    HRESULT hr = g_calllog_orig.CreateGraphicsPipelineState(This, desc, riid, pipeline_state);
+    mad_calllog_note(CALLLOG_CreateGraphicsPipelineState, "CreateGraphicsPipelineState", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateComputePipelineState(ID3D12Device10 *This, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc, REFIID riid, void **pipeline_state) {
+    HRESULT hr = g_calllog_orig.CreateComputePipelineState(This, desc, riid, pipeline_state);
+    mad_calllog_note(CALLLOG_CreateComputePipelineState, "CreateComputePipelineState", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommandList(ID3D12Device10 *This, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator *command_allocator, ID3D12PipelineState *initial_pipeline_state, REFIID riid, void **command_list) {
+    HRESULT hr = g_calllog_orig.CreateCommandList(This, node_mask, type, command_allocator, initial_pipeline_state, riid, command_list);
+    mad_calllog_note(CALLLOG_CreateCommandList, "CreateCommandList", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateDescriptorHeap(ID3D12Device10 *This, const D3D12_DESCRIPTOR_HEAP_DESC *desc, REFIID riid, void **descriptor_heap) {
+    HRESULT hr = g_calllog_orig.CreateDescriptorHeap(This, desc, riid, descriptor_heap);
+    mad_calllog_note(CALLLOG_CreateDescriptorHeap, "CreateDescriptorHeap", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateRootSignature(ID3D12Device10 *This, UINT node_mask, const void *bytecode, SIZE_T bytecode_length, REFIID riid, void **root_signature) {
+    HRESULT hr = g_calllog_orig.CreateRootSignature(This, node_mask, bytecode, bytecode_length, riid, root_signature);
+    mad_calllog_note(CALLLOG_CreateRootSignature, "CreateRootSignature", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
+    HRESULT hr = g_calllog_orig.CreateCommittedResource(This, heap_properties, heap_flags, desc, initial_state, optimized_clear_value, riid, resource);
+    mad_calllog_note(CALLLOG_CreateCommittedResource, "CreateCommittedResource", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateHeap(ID3D12Device10 *This, const D3D12_HEAP_DESC *desc, REFIID riid, void **heap) {
+    HRESULT hr = g_calllog_orig.CreateHeap(This, desc, riid, heap);
+    mad_calllog_note(CALLLOG_CreateHeap, "CreateHeap", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreatePlacedResource(ID3D12Device10 *This, ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
+    HRESULT hr = g_calllog_orig.CreatePlacedResource(This, heap, heap_offset, desc, initial_state, optimized_clear_value, riid, resource);
+    mad_calllog_note(CALLLOG_CreatePlacedResource, "CreatePlacedResource", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateReservedResource(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
+    HRESULT hr = g_calllog_orig.CreateReservedResource(This, desc, initial_state, optimized_clear_value, riid, resource);
+    mad_calllog_note(CALLLOG_CreateReservedResource, "CreateReservedResource", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateSharedHandle(ID3D12Device10 *This, ID3D12DeviceChild *object, const SECURITY_ATTRIBUTES *attributes, DWORD access, const WCHAR *name, HANDLE *handle) {
+    HRESULT hr = g_calllog_orig.CreateSharedHandle(This, object, attributes, access, name, handle);
+    mad_calllog_note(CALLLOG_CreateSharedHandle, "CreateSharedHandle", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_OpenSharedHandle(ID3D12Device10 *This, HANDLE handle, REFIID riid, void **object) {
+    HRESULT hr = g_calllog_orig.OpenSharedHandle(This, handle, riid, object);
+    mad_calllog_note(CALLLOG_OpenSharedHandle, "OpenSharedHandle", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_OpenSharedHandleByName(ID3D12Device10 *This, const WCHAR *name, DWORD access, HANDLE *handle) {
+    HRESULT hr = g_calllog_orig.OpenSharedHandleByName(This, name, access, handle);
+    mad_calllog_note(CALLLOG_OpenSharedHandleByName, "OpenSharedHandleByName", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_MakeResident(ID3D12Device10 *This, UINT object_count, ID3D12Pageable *const *objects) {
+    HRESULT hr = g_calllog_orig.MakeResident(This, object_count, objects);
+    mad_calllog_note(CALLLOG_MakeResident, "MakeResident", hr, 1);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_Evict(ID3D12Device10 *This, UINT object_count, ID3D12Pageable *const *objects) {
+    HRESULT hr = g_calllog_orig.Evict(This, object_count, objects);
+    mad_calllog_note(CALLLOG_Evict, "Evict", hr, 1);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateFence(ID3D12Device10 *This, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid, void **fence) {
+    HRESULT hr = g_calllog_orig.CreateFence(This, initial_value, flags, riid, fence);
+    mad_calllog_note(CALLLOG_CreateFence, "CreateFence", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_GetDeviceRemovedReason(ID3D12Device10 *This) {
+    HRESULT hr = g_calllog_orig.GetDeviceRemovedReason(This);
+    mad_calllog_note(CALLLOG_GetDeviceRemovedReason, "GetDeviceRemovedReason", hr, 1);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateQueryHeap(ID3D12Device10 *This, const D3D12_QUERY_HEAP_DESC *desc, REFIID riid, void **heap) {
+    HRESULT hr = g_calllog_orig.CreateQueryHeap(This, desc, riid, heap);
+    mad_calllog_note(CALLLOG_CreateQueryHeap, "CreateQueryHeap", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_SetStablePowerState(ID3D12Device10 *This, WINBOOL enable) {
+    HRESULT hr = g_calllog_orig.SetStablePowerState(This, enable);
+    mad_calllog_note(CALLLOG_SetStablePowerState, "SetStablePowerState", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommandSignature(ID3D12Device10 *This, const D3D12_COMMAND_SIGNATURE_DESC *desc, ID3D12RootSignature *root_signature, REFIID riid, void **command_signature) {
+    HRESULT hr = g_calllog_orig.CreateCommandSignature(This, desc, root_signature, riid, command_signature);
+    mad_calllog_note(CALLLOG_CreateCommandSignature, "CreateCommandSignature", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreatePipelineLibrary(ID3D12Device10 *This, const void *blob, SIZE_T blob_size, REFIID iid, void **lib) {
+    HRESULT hr = g_calllog_orig.CreatePipelineLibrary(This, blob, blob_size, iid, lib);
+    mad_calllog_note(CALLLOG_CreatePipelineLibrary, "CreatePipelineLibrary", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_SetEventOnMultipleFenceCompletion(ID3D12Device10 *This, ID3D12Fence *const *fences, const UINT64 *values, UINT fence_count, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event) {
+    HRESULT hr = g_calllog_orig.SetEventOnMultipleFenceCompletion(This, fences, values, fence_count, flags, event);
+    mad_calllog_note(CALLLOG_SetEventOnMultipleFenceCompletion, "SetEventOnMultipleFenceCompletion", hr, 1);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_SetResidencyPriority(ID3D12Device10 *This, UINT object_count, ID3D12Pageable *const *objects, const D3D12_RESIDENCY_PRIORITY *priorities) {
+    HRESULT hr = g_calllog_orig.SetResidencyPriority(This, object_count, objects, priorities);
+    mad_calllog_note(CALLLOG_SetResidencyPriority, "SetResidencyPriority", hr, 1);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreatePipelineState(ID3D12Device10 *This, const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID riid, void **pipeline_state) {
+    HRESULT hr = g_calllog_orig.CreatePipelineState(This, desc, riid, pipeline_state);
+    mad_calllog_note(CALLLOG_CreatePipelineState, "CreatePipelineState", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_OpenExistingHeapFromAddress(ID3D12Device10 *This, const void *address, REFIID riid, void **heap) {
+    HRESULT hr = g_calllog_orig.OpenExistingHeapFromAddress(This, address, riid, heap);
+    mad_calllog_note(CALLLOG_OpenExistingHeapFromAddress, "OpenExistingHeapFromAddress", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_OpenExistingHeapFromFileMapping(ID3D12Device10 *This, HANDLE file_mapping, REFIID riid, void **heap) {
+    HRESULT hr = g_calllog_orig.OpenExistingHeapFromFileMapping(This, file_mapping, riid, heap);
+    mad_calllog_note(CALLLOG_OpenExistingHeapFromFileMapping, "OpenExistingHeapFromFileMapping", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_EnqueueMakeResident(ID3D12Device10 *This, D3D12_RESIDENCY_FLAGS flags, UINT num_objects, ID3D12Pageable *const *objects, ID3D12Fence *fence, UINT64 fence_value) {
+    HRESULT hr = g_calllog_orig.EnqueueMakeResident(This, flags, num_objects, objects, fence, fence_value);
+    mad_calllog_note(CALLLOG_EnqueueMakeResident, "EnqueueMakeResident", hr, 1);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommandList1(ID3D12Device10 *This, UINT node_mask, D3D12_COMMAND_LIST_TYPE type, D3D12_COMMAND_LIST_FLAGS flags, REFIID riid, void **command_list) {
+    HRESULT hr = g_calllog_orig.CreateCommandList1(This, node_mask, type, flags, riid, command_list);
+    mad_calllog_note(CALLLOG_CreateCommandList1, "CreateCommandList1", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateProtectedResourceSession(ID3D12Device10 *This, const D3D12_PROTECTED_RESOURCE_SESSION_DESC *desc, REFIID riid, void **session) {
+    HRESULT hr = g_calllog_orig.CreateProtectedResourceSession(This, desc, riid, session);
+    mad_calllog_note(CALLLOG_CreateProtectedResourceSession, "CreateProtectedResourceSession", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource1(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_resource_state, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, REFIID riid_resource, void **resource) {
+    HRESULT hr = g_calllog_orig.CreateCommittedResource1(This, heap_properties, heap_flags, desc, initial_resource_state, optimized_clear_value, protected_session, riid_resource, resource);
+    mad_calllog_note(CALLLOG_CreateCommittedResource1, "CreateCommittedResource1", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateHeap1(ID3D12Device10 *This, const D3D12_HEAP_DESC *desc, ID3D12ProtectedResourceSession *protected_session, REFIID riid, void **heap) {
+    HRESULT hr = g_calllog_orig.CreateHeap1(This, desc, protected_session, riid, heap);
+    mad_calllog_note(CALLLOG_CreateHeap1, "CreateHeap1", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateReservedResource1(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, REFIID riid, void **resource) {
+    HRESULT hr = g_calllog_orig.CreateReservedResource1(This, desc, initial_state, optimized_clear_value, protected_session, riid, resource);
+    mad_calllog_note(CALLLOG_CreateReservedResource1, "CreateReservedResource1", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateLifetimeTracker(ID3D12Device10 *This, ID3D12LifetimeOwner *owner, REFIID riid, void **tracker) {
+    HRESULT hr = g_calllog_orig.CreateLifetimeTracker(This, owner, riid, tracker);
+    mad_calllog_note(CALLLOG_CreateLifetimeTracker, "CreateLifetimeTracker", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_EnumerateMetaCommands(ID3D12Device10 *This, UINT *meta_commands_count, D3D12_META_COMMAND_DESC *descs) {
+    HRESULT hr = g_calllog_orig.EnumerateMetaCommands(This, meta_commands_count, descs);
+    mad_calllog_note(CALLLOG_EnumerateMetaCommands, "EnumerateMetaCommands", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_EnumerateMetaCommandParameters(ID3D12Device10 *This, REFGUID command_id, D3D12_META_COMMAND_PARAMETER_STAGE stage, UINT *total_structure_size_in_bytes, UINT *parameter_count, D3D12_META_COMMAND_PARAMETER_DESC *parameter_descs) {
+    HRESULT hr = g_calllog_orig.EnumerateMetaCommandParameters(This, command_id, stage, total_structure_size_in_bytes, parameter_count, parameter_descs);
+    mad_calllog_note(CALLLOG_EnumerateMetaCommandParameters, "EnumerateMetaCommandParameters", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateMetaCommand(ID3D12Device10 *This, REFGUID command_id, UINT node_mask, const void *creation_parameters_data, SIZE_T creation_parameters_data_size_in_bytes, REFIID riid, void **meta_command) {
+    HRESULT hr = g_calllog_orig.CreateMetaCommand(This, command_id, node_mask, creation_parameters_data, creation_parameters_data_size_in_bytes, riid, meta_command);
+    mad_calllog_note(CALLLOG_CreateMetaCommand, "CreateMetaCommand", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateStateObject(ID3D12Device10 *This, const D3D12_STATE_OBJECT_DESC *desc, REFIID riid, void **state_object) {
+    HRESULT hr = g_calllog_orig.CreateStateObject(This, desc, riid, state_object);
+    mad_calllog_note(CALLLOG_CreateStateObject, "CreateStateObject", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_SetBackgroundProcessingMode(ID3D12Device10 *This, D3D12_BACKGROUND_PROCESSING_MODE mode, D3D12_MEASUREMENTS_ACTION action, HANDLE event, WINBOOL *further_measurements_desired) {
+    HRESULT hr = g_calllog_orig.SetBackgroundProcessingMode(This, mode, action, event, further_measurements_desired);
+    mad_calllog_note(CALLLOG_SetBackgroundProcessingMode, "SetBackgroundProcessingMode", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_AddToStateObject(ID3D12Device10 *This, const D3D12_STATE_OBJECT_DESC *addition, ID3D12StateObject *state_object_to_grow_from, REFIID riid, void **new_state_object) {
+    HRESULT hr = g_calllog_orig.AddToStateObject(This, addition, state_object_to_grow_from, riid, new_state_object);
+    mad_calllog_note(CALLLOG_AddToStateObject, "AddToStateObject", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateProtectedResourceSession1(ID3D12Device10 *This, const D3D12_PROTECTED_RESOURCE_SESSION_DESC1 *desc, REFIID riid, void **session) {
+    HRESULT hr = g_calllog_orig.CreateProtectedResourceSession1(This, desc, riid, session);
+    mad_calllog_note(CALLLOG_CreateProtectedResourceSession1, "CreateProtectedResourceSession1", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource2(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_resource_state, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, REFIID riid_resource, void **resource) {
+    HRESULT hr = g_calllog_orig.CreateCommittedResource2(This, heap_properties, heap_flags, desc, initial_resource_state, optimized_clear_value, protected_session, riid_resource, resource);
+    mad_calllog_note(CALLLOG_CreateCommittedResource2, "CreateCommittedResource2", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreatePlacedResource1(ID3D12Device10 *This, ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_RESOURCE_STATES initial_state, const D3D12_CLEAR_VALUE *optimized_clear_value, REFIID riid, void **resource) {
+    HRESULT hr = g_calllog_orig.CreatePlacedResource1(This, heap, heap_offset, desc, initial_state, optimized_clear_value, riid, resource);
+    mad_calllog_note(CALLLOG_CreatePlacedResource1, "CreatePlacedResource1", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateShaderCacheSession(ID3D12Device10 *This, const D3D12_SHADER_CACHE_SESSION_DESC *desc, REFIID riid, void **session) {
+    HRESULT hr = g_calllog_orig.CreateShaderCacheSession(This, desc, riid, session);
+    mad_calllog_note(CALLLOG_CreateShaderCacheSession, "CreateShaderCacheSession", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_ShaderCacheControl(ID3D12Device10 *This, D3D12_SHADER_CACHE_KIND_FLAGS kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS control) {
+    HRESULT hr = g_calllog_orig.ShaderCacheControl(This, kinds, control);
+    mad_calllog_note(CALLLOG_ShaderCacheControl, "ShaderCacheControl", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommandQueue1(ID3D12Device10 *This, const D3D12_COMMAND_QUEUE_DESC *desc, REFIID creator_id, REFIID riid, void **command_queue) {
+    HRESULT hr = g_calllog_orig.CreateCommandQueue1(This, desc, creator_id, riid, command_queue);
+    mad_calllog_note(CALLLOG_CreateCommandQueue1, "CreateCommandQueue1", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateCommittedResource3(ID3D12Device10 *This, const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags, const D3D12_RESOURCE_DESC1 *desc, D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, UINT32 castable_formats_count, DXGI_FORMAT *castable_formats, REFIID riid_resource, void **resource) {
+    HRESULT hr = g_calllog_orig.CreateCommittedResource3(This, heap_properties, heap_flags, desc, initial_layout, optimized_clear_value, protected_session, castable_formats_count, castable_formats, riid_resource, resource);
+    mad_calllog_note(CALLLOG_CreateCommittedResource3, "CreateCommittedResource3", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreatePlacedResource2(ID3D12Device10 *This, ID3D12Heap *heap, UINT64 heap_offset, const D3D12_RESOURCE_DESC1 *desc, D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE *optimized_clear_value, UINT32 castable_formats_count, DXGI_FORMAT *castable_formats, REFIID riid, void **resource) {
+    HRESULT hr = g_calllog_orig.CreatePlacedResource2(This, heap, heap_offset, desc, initial_layout, optimized_clear_value, castable_formats_count, castable_formats, riid, resource);
+    mad_calllog_note(CALLLOG_CreatePlacedResource2, "CreatePlacedResource2", hr, 0);
+    return hr;
+}
+static HRESULT STDMETHODCALLTYPE calllog_CreateReservedResource2(ID3D12Device10 *This, const D3D12_RESOURCE_DESC *desc, D3D12_BARRIER_LAYOUT initial_layout, const D3D12_CLEAR_VALUE *optimized_clear_value, ID3D12ProtectedResourceSession *protected_session, UINT32 castable_formats_count, DXGI_FORMAT *castable_formats, REFIID riid, void **resource) {
+    HRESULT hr = g_calllog_orig.CreateReservedResource2(This, desc, initial_layout, optimized_clear_value, protected_session, castable_formats_count, castable_formats, riid, resource);
+    mad_calllog_note(CALLLOG_CreateReservedResource2, "CreateReservedResource2", hr, 0);
+    return hr;
+}
+static void mad_calllog_install(void) {
+    char v[8];
+    DWORD n = GetEnvironmentVariableA("MADEIRA_D3D12_CALL_LOG", v, sizeof v);   /* 1 = failed device calls and each method's first call; 2 = every device call; unset/0 = off */
+    g_calllog_level = (n && n < sizeof v) ? atoi(v) : 0;
+    if (g_calllog_level <= 0) return;
+    g_calllog_orig = g_device_vtbl;
+    g_device_vtbl.CreateCommandQueue = calllog_CreateCommandQueue;
+    g_device_vtbl.CreateCommandAllocator = calllog_CreateCommandAllocator;
+    g_device_vtbl.CreateGraphicsPipelineState = calllog_CreateGraphicsPipelineState;
+    g_device_vtbl.CreateComputePipelineState = calllog_CreateComputePipelineState;
+    g_device_vtbl.CreateCommandList = calllog_CreateCommandList;
+    g_device_vtbl.CreateDescriptorHeap = calllog_CreateDescriptorHeap;
+    g_device_vtbl.CreateRootSignature = calllog_CreateRootSignature;
+    g_device_vtbl.CreateCommittedResource = calllog_CreateCommittedResource;
+    g_device_vtbl.CreateHeap = calllog_CreateHeap;
+    g_device_vtbl.CreatePlacedResource = calllog_CreatePlacedResource;
+    g_device_vtbl.CreateReservedResource = calllog_CreateReservedResource;
+    g_device_vtbl.CreateSharedHandle = calllog_CreateSharedHandle;
+    g_device_vtbl.OpenSharedHandle = calllog_OpenSharedHandle;
+    g_device_vtbl.OpenSharedHandleByName = calllog_OpenSharedHandleByName;
+    g_device_vtbl.MakeResident = calllog_MakeResident;
+    g_device_vtbl.Evict = calllog_Evict;
+    g_device_vtbl.CreateFence = calllog_CreateFence;
+    g_device_vtbl.GetDeviceRemovedReason = calllog_GetDeviceRemovedReason;
+    g_device_vtbl.CreateQueryHeap = calllog_CreateQueryHeap;
+    g_device_vtbl.SetStablePowerState = calllog_SetStablePowerState;
+    g_device_vtbl.CreateCommandSignature = calllog_CreateCommandSignature;
+    g_device_vtbl.CreatePipelineLibrary = calllog_CreatePipelineLibrary;
+    g_device_vtbl.SetEventOnMultipleFenceCompletion = calllog_SetEventOnMultipleFenceCompletion;
+    g_device_vtbl.SetResidencyPriority = calllog_SetResidencyPriority;
+    g_device_vtbl.CreatePipelineState = calllog_CreatePipelineState;
+    g_device_vtbl.OpenExistingHeapFromAddress = calllog_OpenExistingHeapFromAddress;
+    g_device_vtbl.OpenExistingHeapFromFileMapping = calllog_OpenExistingHeapFromFileMapping;
+    g_device_vtbl.EnqueueMakeResident = calllog_EnqueueMakeResident;
+    g_device_vtbl.CreateCommandList1 = calllog_CreateCommandList1;
+    g_device_vtbl.CreateProtectedResourceSession = calllog_CreateProtectedResourceSession;
+    g_device_vtbl.CreateCommittedResource1 = calllog_CreateCommittedResource1;
+    g_device_vtbl.CreateHeap1 = calllog_CreateHeap1;
+    g_device_vtbl.CreateReservedResource1 = calllog_CreateReservedResource1;
+    g_device_vtbl.CreateLifetimeTracker = calllog_CreateLifetimeTracker;
+    g_device_vtbl.EnumerateMetaCommands = calllog_EnumerateMetaCommands;
+    g_device_vtbl.EnumerateMetaCommandParameters = calllog_EnumerateMetaCommandParameters;
+    g_device_vtbl.CreateMetaCommand = calllog_CreateMetaCommand;
+    g_device_vtbl.CreateStateObject = calllog_CreateStateObject;
+    g_device_vtbl.SetBackgroundProcessingMode = calllog_SetBackgroundProcessingMode;
+    g_device_vtbl.AddToStateObject = calllog_AddToStateObject;
+    g_device_vtbl.CreateProtectedResourceSession1 = calllog_CreateProtectedResourceSession1;
+    g_device_vtbl.CreateCommittedResource2 = calllog_CreateCommittedResource2;
+    g_device_vtbl.CreatePlacedResource1 = calllog_CreatePlacedResource1;
+    g_device_vtbl.CreateShaderCacheSession = calllog_CreateShaderCacheSession;
+    g_device_vtbl.ShaderCacheControl = calllog_ShaderCacheControl;
+    g_device_vtbl.CreateCommandQueue1 = calllog_CreateCommandQueue1;
+    g_device_vtbl.CreateCommittedResource3 = calllog_CreateCommittedResource3;
+    g_device_vtbl.CreatePlacedResource2 = calllog_CreatePlacedResource2;
+    g_device_vtbl.CreateReservedResource2 = calllog_CreateReservedResource2;
+    d3d12_log("[d3d12-call] device call log on, level %d (MADEIRA_D3D12_CALL_LOG): %d methods wrapped\n",
+              g_calllog_level, (int)CALLLOG_COUNT);
+}
+
 /* ---- vtable construction ------------------------------------------------- */
 static void build_vtables(void) {
     static LONG done;
@@ -21470,6 +21852,8 @@ static void build_vtables(void) {
     g_fence_vtbl.GetCompletedValue      = fence_GetCompletedValue;
     g_fence_vtbl.SetEventOnCompletion   = fence_SetEventOnCompletion;
     g_fence_vtbl.Signal                 = fence_Signal;
+
+    mad_calllog_install();   /* last: wraps the finished device table (MADEIRA_D3D12_CALL_LOG) */
 }
 
 /* ---- exports ------------------------------------------------------------- */
