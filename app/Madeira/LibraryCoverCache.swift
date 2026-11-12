@@ -709,3 +709,32 @@ extension LibraryCoverCache.Source {
         return Self(key: "\(store)-\(id)", urls: [url])
     }
 }
+
+// MARK: - Kept from the zoomable grid (its files are gone; the cover cache still uses these)
+
+/// The widest card a cover was ever drawn for, and the space around a cover inside its card.
+enum LibraryGridGeometry {
+    static let maxCard: CGFloat = 220
+    static let cardPadding: CGFloat = 4
+}
+
+/// Runs `action` on the next display frame.
+@MainActor final class LibraryGridNextFrame: NSObject {
+    private var link: CADisplayLink?
+    private let action: () -> Void
+    private static var waiting: Set<LibraryGridNextFrame> = []
+    private init(_ action: @escaping () -> Void) { self.action = action }
+    static func run(_ action: @escaping () -> Void) {
+        let next = LibraryGridNextFrame(action)
+        let link = CADisplayLink(target: next, selector: #selector(fire))
+        link.add(to: .main, forMode: .common)
+        next.link = link
+        waiting.insert(next)
+    }
+    @objc private func fire() {
+        link?.invalidate()
+        link = nil
+        Self.waiting.remove(self)
+        action()
+    }
+}

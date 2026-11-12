@@ -209,7 +209,7 @@ struct WineGeckoSettingsSection: View {
                     Button("Remove Wine Gecko", role: .destructive) { confirmRemove = true }
                 } else {
                     Button { gecko.install() } label: {
-                        Label(gecko.error == nil ? "Download Wine Gecko" : "Try again", systemImage: "arrow.down.circle")
+                        Label(gecko.error == nil ? "Download Wine Gecko" : "Try Again", systemImage: "arrow.down.circle")
                     }
                 }
             }

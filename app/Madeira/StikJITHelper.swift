@@ -584,6 +584,11 @@ enum StikJITHelper {
         } else if exeWinWantedMB > 0 {
             LogStore.shared.log("[exe-window] exe-window-mb = \(exeWinWantedMB) ignored: the executable window is not held", level: .error)
         }
+        let windowGuard = !windowHeld && !skipWindow
+            && (ProcessInfo.processInfo.environment["MADEIRA_POOL_WINDOW_GUARD"].map { $0 != "0" } ?? true)
+        if windowGuard {
+            LogStore.shared.log("[pool-window-guard] the executable window is not held: the census skips it and its free part is plugged during the pool request (env.MADEIRA_POOL_WINDOW_GUARD = 0 turns this off)")
+        }
         do {
             var holes: [(base: vm_address_t, size: vm_address_t)] = []
             var addr = vm_address_t(goodLow)
@@ -600,7 +605,20 @@ enum StikJITHelper {
                 }
                 if kr != KERN_SUCCESS { break }
                 let start = min(addr, vm_address_t(guestLo))
-                if start > prevEnd && start - prevEnd >= 64 << 20 { holes.append((prevEnd, start - prevEnd)) }
+                if start > prevEnd {
+                    // [pool-window-guard] the window was not held (something else sits in
+                    // it): never count its free part as a pool hole, or the pool lands on
+                    // 0x140000000 and is rejected (Project Playtime, run #2).
+                    var parts: [(vm_address_t, vm_address_t)] = [(prevEnd, start)]
+                    if windowGuard {
+                        let wEnd = exeWinBase + exeWinSize
+                        parts = parts.flatMap { (lo, hi) -> [(vm_address_t, vm_address_t)] in
+                            guard lo < wEnd && hi > exeWinBase else { return [(lo, hi)] }
+                            return [(lo, min(hi, exeWinBase)), (max(lo, wEnd), hi)].filter { $0.1 > $0.0 }
+                        }
+                    }
+                    for (lo, hi) in parts where hi - lo >= 64 << 20 { holes.append((lo, hi - lo)) }
+                }
                 prevEnd = max(prevEnd, addr + vm_address_t(rsize))
                 addr = prevEnd
             }
@@ -736,6 +754,19 @@ enum StikJITHelper {
             }
         }
 
+        // [pool-window-guard] first-fit must not land in the window's free part.
+        if windowGuard {
+            for h in freeRuns(exeWinBase, exeWinBase + exeWinSize, minSize: 0x4000) {
+                var a = h.base
+                if vm_allocate(mach_task_self_, &a, vm_size_t(h.size), 0 /* VM_FLAGS_FIXED */) == KERN_SUCCESS {
+                    if a == h.base {
+                        plugs.append((a, vm_size_t(h.size)))
+                        LogStore.shared.log(String(format: "[pool-window-guard] plugged 0x%lx+%luKB inside the executable window",
+                                                   Int(h.base), Int(h.size >> 10)))
+                    } else { vm_deallocate(mach_task_self_, a, vm_size_t(h.size)) }
+                }
+            }
+        }
         var rxPtrOpt: UnsafeMutableRawPointer? = nil
         var requestUnanswered = false
         for attempt in 0..<3 {

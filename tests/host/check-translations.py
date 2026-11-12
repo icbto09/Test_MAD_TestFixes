@@ -49,6 +49,11 @@ for swift in app.glob('*.swift'):
         text = re.sub(r'\\u\{([0-9A-Fa-f]+)\}', lambda x: chr(int(x.group(1), 16)), text)
         literals.add(re.sub(r'\\(["\\nt\'])', lambda x: {'n': '\n', 't': '\t'}.get(x.group(1), x.group(1)), text))
 
+# A Settings page's name is looked up when it is shown (L(page.title)): the names in SettingsPages.Page.title.
+_pages = (app / 'SettingsPages.swift').read_text(encoding='utf-8')
+_titles = _pages[_pages.index('var title: String {'):]
+literals |= set(re.findall(r'case \.\w+: return "([^"]+)"', _titles[:_titles.index('\n        }\n')]))
+
 strings = catalog['strings']
 # An Int interpolation is keyed %lld by SwiftUI, a String one %@; the source scan sees both as %@.
 def shape(key):

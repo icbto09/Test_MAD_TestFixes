@@ -25,6 +25,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "objbase.h"
+#include "mmreg.h"
 
 #include "sapiddk.h"
 #include "sperror.h"
@@ -101,22 +102,60 @@ static ULONG WINAPI ttsengine_Release(ISpTTSEngine *iface)
     return ref;
 }
 
+/* Madeira: Wine's engine has no voice yet; both methods were E_NOTIMPL, which fails every
+ * SpVoice::Speak (and, through it, a game's narration at start). Speak succeeds with no audio
+ * instead, and GetOutputFormat takes the format SpVoice asks for when it is PCM (so SpVoice needs
+ * no resampler), otherwise 16 kHz 16-bit mono. Nothing is written to the site, so the audio
+ * stream's event stays signalled and SpVoice's wait returns at once. */
+/* SPDFID_WaveFormatEx; sapi.h only declares it */
+static const GUID wave_format_ex_id = {0xc31adbae, 0x527f, 0x4ff5, {0xa2, 0x30, 0xf6, 0x2b, 0xb6, 0x1f, 0xf7, 0x0c}};
+
 static HRESULT WINAPI ttsengine_Speak(ISpTTSEngine *iface, DWORD flags, REFGUID fmtid,
                                       const WAVEFORMATEX *wfx, const SPVTEXTFRAG *frag_list,
                                       ISpTTSEngineSite *site)
 {
-    FIXME("(%p, %#lx, %s, %p, %p, %p): stub.\n", iface, flags, debugstr_guid(fmtid), wfx, frag_list, site);
+    static LONG once;
 
-    return E_NOTIMPL;
+    if (!InterlockedExchange(&once, 1))
+        FIXME("(%p, %#lx, %s, %p, %p, %p): no voice yet, speaking silently.\n", iface, flags, debugstr_guid(fmtid),
+              wfx, frag_list, site);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ttsengine_GetOutputFormat(ISpTTSEngine *iface, const GUID *fmtid,
                                                 const WAVEFORMATEX *wfx, GUID *out_fmtid,
                                                 WAVEFORMATEX **out_wfx)
 {
-    FIXME("(%p, %s, %p, %p, %p): stub.\n", iface, debugstr_guid(fmtid), wfx, out_fmtid, out_wfx);
+    WAVEFORMATEX *fmt;
 
-    return E_NOTIMPL;
+    TRACE("(%p, %s, %p, %p, %p).\n", iface, debugstr_guid(fmtid), wfx, out_fmtid, out_wfx);
+
+    if (!out_fmtid || !out_wfx)
+        return E_POINTER;
+    if (!(fmt = CoTaskMemAlloc(sizeof(*fmt))))
+        return E_OUTOFMEMORY;
+
+    if (fmtid && IsEqualGUID(fmtid, &wave_format_ex_id) && wfx && wfx->wFormatTag == WAVE_FORMAT_PCM &&
+        wfx->nChannels && wfx->nSamplesPerSec && wfx->wBitsPerSample)
+    {
+        *fmt = *wfx;
+        fmt->cbSize = 0;
+    }
+    else
+    {
+        fmt->wFormatTag = WAVE_FORMAT_PCM;
+        fmt->nChannels = 1;
+        fmt->nSamplesPerSec = 16000;
+        fmt->wBitsPerSample = 16;
+        fmt->nBlockAlign = fmt->nChannels * fmt->wBitsPerSample / 8;
+        fmt->nAvgBytesPerSec = fmt->nSamplesPerSec * fmt->nBlockAlign;
+        fmt->cbSize = 0;
+    }
+
+    *out_fmtid = wave_format_ex_id;
+    *out_wfx = fmt;
+    return S_OK;
 }
 
 static ISpTTSEngineVtbl ttsengine_vtbl =

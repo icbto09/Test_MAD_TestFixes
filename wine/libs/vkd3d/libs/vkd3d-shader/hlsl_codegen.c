@@ -2351,6 +2351,25 @@ static bool component_index_from_deref_path_node(struct hlsl_ir_node *path_node,
     return true;
 }
 
+/* Madeira: one ERR line per shader with the place and the index type, so a
+ * game log shows which shader source line produced the odd index. */
+static void log_nonuint_path_index(struct hlsl_ctx *ctx, const struct hlsl_deref *deref,
+        const struct hlsl_ir_node *path_node)
+{
+    struct vkd3d_string_buffer *type_string;
+
+    if (ctx->madeira_nonuint_index_logged)
+        return;
+    ctx->madeira_nonuint_index_logged = true;
+
+    type_string = hlsl_type_to_string(ctx, path_node->data_type);
+    ERR("[hlsl-index] non-uint index (%s, %s) into '%s' at %s:%u:%u; load not propagated.\n",
+            type_string ? type_string->buffer : "?", hlsl_node_type_to_string(path_node->type),
+            deref->var->name, path_node->loc.source_name ? path_node->loc.source_name : "?",
+            path_node->loc.line, path_node->loc.column);
+    hlsl_release_string_buffer(ctx, type_string);
+}
+
 static bool nonconst_index_from_deref(struct hlsl_ctx *ctx, const struct hlsl_deref *deref,
         unsigned int *idx, unsigned int *base, unsigned int *scale, unsigned int *count)
 {
@@ -2367,8 +2386,16 @@ static bool nonconst_index_from_deref(struct hlsl_ctx *ctx, const struct hlsl_de
 
         VKD3D_ASSERT(path_node);
 
-        /* We should always have generated a cast to UINT. */
-        VKD3D_ASSERT(hlsl_is_vec1(path_node->data_type) && path_node->data_type->e.numeric.type == HLSL_TYPE_UINT);
+        /* We should always have generated a cast to UINT, but some shaders
+         * (Factorio's, among others) still reach here with another index type.
+         * Building the affine index below on such a node mixes types, so leave
+         * this load alone instead: it is still correct, just not propagated. */
+        if (!hlsl_is_numeric_type(path_node->data_type) || !hlsl_is_vec1(path_node->data_type)
+                || path_node->data_type->e.numeric.type != HLSL_TYPE_UINT)
+        {
+            log_nonuint_path_index(ctx, deref, path_node);
+            return false;
+        }
 
         next_type = hlsl_get_element_type_from_path_index(ctx, type, path_node);
 

@@ -9,6 +9,9 @@
 import Foundation
 import zlib
 import CommonCrypto
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Progress for one application install, across all of its depots.
 struct SteamDownloadProgress: Equatable, Sendable {
@@ -275,6 +278,9 @@ final class DepotDownloader {
         let started = Date()
         let resumedBytes = state.doneBytes
         var lastReport = Date.distantPast
+        // One [steam-depot] speed line every 10 s, with whether Madeira was in
+        // the background, so a log shows a background slowdown.
+        var speedMark = (time: Date(), bytes: state.doneBytes)
         for (index, plan) in plans.enumerated() {
             let journal = try JournalWriter(url: prepared.journals[index])
             defer { journal.close() }
@@ -289,7 +295,7 @@ final class DepotDownloader {
                     let item = work[next]; next += 1
                     let chunk = plan.manifest.files[item.file].chunks[item.chunk]
                     let path = paths[item.file]
-                    group.addTask {
+                    group.addTask(priority: .userInitiated) {
                         try await Self.fetchChunk(chunk, plan: plan, peer: peer, path: path, attempts: attempts, seed: item.file &+ item.chunk)
                         return (item.key, UInt64(chunk.compressedSize), false)
                     }
@@ -309,6 +315,12 @@ final class DepotDownloader {
                             state.pcDropped = !peer.usable
                         }
                         report(state)
+                    }
+                    if now.timeIntervalSince(speedMark.time) >= 10 {
+                        let window = now.timeIntervalSince(speedMark.time)
+                        let kbPerS = Int(Double(state.doneBytes &- speedMark.bytes) / window / 1024)
+                        speedMark = (now, state.doneBytes)
+                        SteamLog.event("[steam-depot] speed app=\(app.appID) kb-per-s=\(kbPerS) background=\(Self.inBackground ? 1 : 0) done-mb=\(state.doneBytes >> 20)")
                     }
                     enqueue()
                 }
@@ -571,7 +583,7 @@ final class DepotDownloader {
             func enqueue() {
                 guard next < checks.count else { return }
                 let check = checks[next]; next += 1
-                group.addTask { (check, try Self.checkFile(check.path, chunks: check.chunks)) }
+                group.addTask(priority: .userInitiated) { (check, try Self.checkFile(check.path, chunks: check.chunks)) }
             }
             for _ in 0..<min(width, checks.count) { enqueue() }
             for try await (check, results) in group {
@@ -601,18 +613,35 @@ final class DepotDownloader {
         report(state)
     }
 
-    /// Reads one file once, front to back in 16 MB blocks, and compares each
+    /// Whether Madeira is in the background (for the speed line).
+    private static var inBackground: Bool {
+        #if canImport(UIKit)
+        return UIApplication.shared.applicationState == .background
+        #else
+        return false
+        #endif
+    }
+
+    /// Reads one file once, front to back in blocks of up to 16 MB, and compares each
     /// chunk (sorted by offset) with its SHA-1. A missing or short file fails
     /// the chunks it cannot supply.
     private nonisolated static func checkFile(_ path: String, chunks: [DepotManifest.ChunkEntry]) throws -> [Bool] {
         var results = [Bool](repeating: false, count: chunks.count)
+        guard !chunks.isEmpty else { return results }
         let fd = open(path, O_RDONLY)
         guard fd >= 0 else { return results }
         defer { close(fd) }
         _ = fcntl(fd, F_NOCACHE, 1)
         _ = fcntl(fd, F_RDAHEAD, 1)
-        let blockSize = 16 << 20
-        var block = [UInt8](repeating: 0, count: blockSize)
+        // The read buffer is only as big as this file's chunks need (most
+        // files are small), at most 16 MB, and is not zero-filled: a fresh
+        // zeroed 16 MB buffer per file made a resume check of a big game
+        // (18187 files) burn every core for minutes.
+        let maxBlock = 16 << 20
+        let span = chunks.reduce(UInt64(0)) { max($0, $1.offset + UInt64($1.uncompressedSize)) } &- chunks[0].offset
+        let blockSize = Int(min(UInt64(maxBlock), max(span, 1)))
+        let block = UnsafeMutableRawBufferPointer.allocate(byteCount: blockSize, alignment: 16)
+        defer { block.deallocate() }
         var blockStart: UInt64 = 0, blockLength = 0
         var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
         for (i, chunk) in chunks.enumerated() {
@@ -622,11 +651,11 @@ final class DepotDownloader {
             // Refill when this chunk is not wholly inside the block.
             if chunk.offset < blockStart || chunk.offset + UInt64(length) > blockStart + UInt64(blockLength) {
                 blockStart = chunk.offset
-                blockLength = block.withUnsafeMutableBytes { max(0, pread(fd, $0.baseAddress, blockSize, off_t(chunk.offset))) }
+                blockLength = max(0, pread(fd, block.baseAddress, blockSize, off_t(chunk.offset)))
                 if blockLength < length { continue }
             }
             let start = Int(chunk.offset - blockStart)
-            block.withUnsafeBytes { raw in _ = CC_SHA1(raw.baseAddress! + start, CC_LONG(length), &digest) }
+            _ = CC_SHA1(block.baseAddress! + start, CC_LONG(length), &digest)
             results[i] = Data(digest) == chunk.sha
         }
         return results

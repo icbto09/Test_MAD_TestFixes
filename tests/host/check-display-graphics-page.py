@@ -27,7 +27,7 @@ cases = re.search(r'enum Page: Hashable, CaseIterable \{\s*case ([^\n]+\n[^\n]+)
 check('displayGraphics' in cases and not re.search(r'\bgraphics\b|\bdisplay\b', cases),
       'one page case, no separate graphics or display page')
 check('case .displayGraphics: return "Display and Graphics"' in pages, 'row title is "Display and Graphics"')
-check('("Running games", [.displayGraphics, .memory, .pointer])' in pages, 'Running games: one row, then Memory and Pointer')
+check('("Games", [.displayGraphics, .memory, .pointer, .runtimes])' in pages, 'Games: one row, then Memory, Pointer and Runtimes')
 check('case .displayGraphics: return GraphicsSettings.shown || LibraryView.runtimeSettingsShown' in pages,
       'row shows when either part would')
 body = pages[pages.index('case .displayGraphics:\n'):]
@@ -38,8 +38,10 @@ check('if GraphicsSettings.shown { GraphicsSettings' in body and 'if LibraryView
 check('(display-graphics)' in pages, 'tree marker (display-graphics)')
 check('} header: { Text("Display") }' in library and '} header: { Text("Graphics") }' in library,
       'each part keeps its own section header')
-check('settingsShow("display", "refresh"' in library and 'settingsShow("graphics", "Direct3D"' in library,
-      'search still finds both sections')
+# One UI (Nov 10): the long Settings page and its option search are gone; the Search tab finds
+# the page by its name and by what it is for.
+check('settingsShow(' not in library and 'case .displayGraphics: return L("' in pages[pages.index('var blurb: String {'):],
+      'the Search tab finds the page by its name and its one line')
 
 catalog = json.loads((app / 'Localizable.xcstrings').read_text(encoding='utf-8'))['strings']
 for key in ('Display', 'Graphics'):

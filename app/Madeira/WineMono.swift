@@ -436,7 +436,7 @@ struct WineMonoSettingsSection: View {
                     Button("Remove Wine Mono", role: .destructive) { confirmRemove = true }
                 } else {
                     Button { mono.install() } label: {
-                        Label(mono.error == nil ? "Download Wine Mono" : "Try again", systemImage: "arrow.down.circle")
+                        Label(mono.error == nil ? "Download Wine Mono" : "Try Again", systemImage: "arrow.down.circle")
                     }
                 }
             }

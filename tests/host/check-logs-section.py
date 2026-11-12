@@ -36,10 +36,11 @@ def check(condition, label):
 
 check(project.count('/* LogsView.swift in Sources */') == 2 and project.count('/* LogsView.swift */') == 3,
       'LogsView.swift is compiled into the app')
-check('case .logs: return "Logs"' in pages and '.advanced, .logs, .credits' in pages and 'case .logs: LogsSection()' in pages,
+check('case .logs: return "Logs"' in pages and '("Help", [.logs, .advanced])' in pages and 'case .logs: LogsSection()' in pages,
       'Settings lists a Logs page')
 link = 'NavigationLink { Form { LogsSection() }.navigationTitle("Logs") }'
-check(pages.count(link) == 1 and library.count(link) == 1, 'Diagnostics links to Logs, on the pages and on the long page')
+# One UI (Nov 10): the long Settings page is gone from Library.swift.
+check(pages.count(link) == 1 and link not in library, 'Diagnostics links to Logs on the Advanced page')
 check(library.count('ShareLogsButton(entry: entry)') == 1 and
       library.index('Button("Copy Settings"') < library.index('ShareLogsButton(entry: entry)'),
       'Game details offers Share Logs (Get Help from Claude is in the Get Help sheet now)')

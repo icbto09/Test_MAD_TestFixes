@@ -437,7 +437,7 @@ struct VCRedistSettingsSection: View {
             }
             if !redist.busy {
                 Button { redist.install() } label: {
-                    Label(redist.complete ? "Install again" : (redist.error == nil ? "Download and install" : "Try again"),
+                    Label(redist.complete ? "Install again" : (redist.error == nil ? "Download and install" : "Try Again"),
                           systemImage: "arrow.down.circle")
                 }
                 if !redist.installed.isEmpty {

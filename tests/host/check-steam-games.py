@@ -51,9 +51,11 @@ require(games.startswith('// SPDX-License-Identifier: GPL-3.0-or-later\n// Copyr
 require('/* SteamGames.swift in Sources */,' in project and 'path = "SteamGames.swift"' in project,
         'SteamGames.swift is built by the Xcode project')
 content_view = (app / 'ContentView.swift').read_text()
-require('SteamGamesSection(search: search, layout: layout, sort: sort, width: viewport.size.width,\n'
-        '                                      part: .installed, open: { selected = $0 })' in library,
-        "Library: the Steam section is in the library and opens the library's Game details page")
+# One UI (Nov 10): a store's games are on its page in the Stores tab (NewLook.swift), and a game
+# opens the game's page pushed in that tab.
+newlook_ui = (app / 'NewLook.swift').read_text()
+require('case .steam: SteamGamesSection(search: "", layout: "cards", width: width, part: .all, open: open)' in newlook_ui,
+        "Stores: the Steam page lists Steam's games and opens the game's page")
 require('MadeiraDock.games(drive: drive)' in games and 'let drive = MadeiraDock.drive' in games,
         "the section lists exactly what Dock's own discovery finds")
 # Game details: a Steam game is a library entry (its per-game settings) with a Steam section.
@@ -72,7 +74,8 @@ require(run_body.index('try await downloader.install(') < run_body.index('Librar
         'a finished download (record written) gets its library entry; a failed or paused one does not')
 require('LibraryModel.shared.removeSteam(appID: game.id)' in owned_source[owned_source.index('func uninstall(_ game: DockGame)'):],
         "Uninstall removes the game's library entry with its files")
-detail = library[library.index('struct LibraryDetail: View {'):library.index('struct FPSChoice: View {')]
+detail = (library[library.index('struct LibraryDetail: View {'):library.index('struct FPSChoice: View {')]
+          + library[library.index('// MARK: - New look game page'):library.index('// MARK: - New look: the starting screen')])
 steam_section = games[games.index('struct SteamEntrySection'):]
 require('SteamEntrySection(entry: $entry)' in detail and 'if entry.steamAppID != nil {' in detail,
         'Game details: the Steam section for a Steam game')
@@ -83,16 +86,16 @@ for label in ['"Start with"', '"Madeira Dock"', '"Smaller JIT pool (512 MB) for 
 for label in ['"Library details"', '"Choose cover image"', '"Use Steam artwork"', '"Display"', '"Resolution"',
               '"Aspect & scaling"', '"Compatibility & performance"', '"x87 precision"', '"CPU cores reported"',
               '"D3D9 anisotropic filtering"', '"On screen"', '"Performance overlay"', '"Live logs"', '"Touch controls"',
-              '"Control opacity"', '"Control size"', '"Executable"', '"Game details"']:
+              '"Control opacity"', '"Control size"', '"Executable"']:
     require(label in detail, f'Game details: {label}')
 require('if entry.anisotropyLimit != nil {\n                Picker("D3D9 anisotropic filtering"' in detail,
         'Game details: D3D9 anisotropic filtering only for a game that already has a limit (to set it back)')
 # #461: every library entry but the Desktop has Launch arguments, Steam games too.
 require('if entry.desktop != true {\n            Section {\n                TextField("Launch arguments"' in detail,
         'Launch arguments for every entry but the Desktop, Steam games included (#461)')
-entries_start = library.index('private var entries: [LibraryEntry] {')
-require('$0.steamAppID == nil' in library[entries_start:library.index('var body: some View {', entries_start)],
-        'Steam games are listed in the Steam section only, not also under Games')
+added = newlook_ui[newlook_ui.index('@MainActor static func added() -> [LibraryEntry] {'):]
+require('entry.steamAppID == nil' in added[:added.index('\n    }\n')],
+        'Steam games are listed on the Steam page only, not also under Other games')
 # A card's pills: an installed game shows a library game's (its size), no
 # "Madeira Dock" or "Steam" pill; "Update" joins them; any other state keeps its own pill.
 cell = games[games.index('struct SteamGameCell: View {'):games.index('/// Progress, speed and the state of one download.')]
@@ -103,7 +106,8 @@ require('@ViewBuilder private func pills(_ status: SteamGamesRules.Status, _ ent
         '"Madeira Dock"' not in rules and '"Steam"' not in rules,
         "an installed game's card shows the library pills (and Update), any other state its own pill, in all three "
         "layouts (dense list, list, grid); no Dock or Steam pill")
-badges = library[library.index('struct LibraryBadges: View {'):library.index('struct LibraryStatus: View {')]
+badges = library[library.index('struct LibraryBadges: View {'):]
+badges = badges[:badges.index('\nstruct ', 10)]
 # The pills' texts are one rule (LibraryBadges.formatTexts, also the zoomable grid's measured labels).
 # No bitness or graphics API pill: both were read from the program before it ran and were often wrong.
 require('entry.bits' not in badges and 'graphicsAPI' not in badges and 'if let note { texts.append(note) }' in badges and

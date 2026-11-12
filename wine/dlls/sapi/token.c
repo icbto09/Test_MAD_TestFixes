@@ -522,6 +522,48 @@ static HRESULT WINAPI create_data_key_with_hkey( HKEY key, ISpRegDataKey **data_
     return hr;
 }
 
+/* Madeira: the prefix registers "Wine Default Voice" as an empty token (sapi.rgs gives it
+ * only an Attributes key), so a voice made from it has no engine: token_CreateInstance finds no
+ * CLSID and SpVoice::Speak fails. Grounded starts its narration at launch and stopped there on the
+ * 0.1.3 line. Fill in what a Windows voice token has (the engine's CLSID, a name, the attributes
+ * programs filter on) and the category's default voice when the voices category is opened. Only
+ * values that are missing are written, so a voice someone installed is never changed. The engine
+ * is msttsengine (TTSEngineCom). */
+static void madeira_complete_default_voice( HKEY voices )
+{
+    static const struct { const WCHAR *name, *value; } attributes[] =
+    {
+        { L"Name", L"Wine Default Voice" },
+        { L"Language", L"409" },
+        { L"Gender", L"Female" },
+        { L"Age", L"Adult" },
+        { L"Vendor", L"Wine" },
+    };
+    static const WCHAR clsid[] = L"{C64501F6-E6E6-451F-A150-25D0839BC510}";
+    static const WCHAR name[] = L"Wine Default Voice";
+    static const WCHAR default_id[] = L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices\\Tokens\\Wine Default Voice";
+    HKEY token, attr;
+    unsigned int i;
+
+    if (RegOpenKeyExW( voices, L"Tokens\\Wine Default Voice", 0, KEY_ALL_ACCESS, &token )) return;
+    /* SpVoice takes its voice from here (token_category_GetDefaultTokenId) */
+    if (RegQueryValueExW( voices, L"DefaultDefaultTokenId", NULL, NULL, NULL, NULL ))
+        RegSetValueExW( voices, L"DefaultDefaultTokenId", 0, REG_SZ, (const BYTE *)default_id, sizeof(default_id) );
+    if (RegQueryValueExW( token, L"CLSID", NULL, NULL, NULL, NULL ))
+        RegSetValueExW( token, L"CLSID", 0, REG_SZ, (const BYTE *)clsid, sizeof(clsid) );
+    if (RegQueryValueExW( token, NULL, NULL, NULL, NULL, NULL ))
+        RegSetValueExW( token, NULL, 0, REG_SZ, (const BYTE *)name, sizeof(name) );
+    if (!RegCreateKeyExW( token, L"Attributes", 0, NULL, 0, KEY_ALL_ACCESS, NULL, &attr, NULL ))
+    {
+        for (i = 0; i < ARRAY_SIZE(attributes); i++)
+            if (RegQueryValueExW( attr, attributes[i].name, NULL, NULL, NULL, NULL ))
+                RegSetValueExW( attr, attributes[i].name, 0, REG_SZ, (const BYTE *)attributes[i].value,
+                                (lstrlenW( attributes[i].value ) + 1) * sizeof(WCHAR) );
+        RegCloseKey( attr );
+    }
+    RegCloseKey( token );
+}
+
 static HRESULT WINAPI token_category_SetId( ISpObjectTokenCategory *iface,
                                             LPCWSTR id, BOOL create )
 {
@@ -543,6 +585,8 @@ static HRESULT WINAPI token_category_SetId( ISpObjectTokenCategory *iface,
     else
         res = RegOpenKeyExW( root, subkey, 0, KEY_ALL_ACCESS, &key );
     if (res) return SPERR_INVALID_REGISTRY_KEY;
+
+    if (!wcsicmp( id, SPCAT_VOICES )) madeira_complete_default_voice( key );
 
     if (FAILED(hr = create_data_key_with_hkey( key, &This->data_key )))
     {

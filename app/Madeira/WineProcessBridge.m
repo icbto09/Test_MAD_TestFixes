@@ -1160,17 +1160,7 @@ static void madeira_setup_vulkan(NSFileManager *fm, NSString *prefix, NSString *
         for (NSString *dll in vulkan_dlls) {
             NSString *path = [[win stringByAppendingPathComponent:dir] stringByAppendingPathComponent:dll];
             NSString *dest = [fm destinationOfSymbolicLinkAtPath:path error:nil];
-            BOOL ours = dest && [dest rangeOfString:@"/vulkan/arm64ec-windows/"].location != NSNotFound;
-            /* A real file, not a link: no farm ships these two names, so it is a stray copy
-             * left in the prefix. In a desktop session (explorer.exe, the aarch64 farm) only
-             * sysx64 is relinked below, and an x64 game finds a stray system32\vulkan-1.dll
-             * first: no winevulkan, "Unable to find a suitable graphics card". */
-            BOOL stray = !dest && [fm fileExistsAtPath:path];
-            if (stray)
-                dprintf(STDERR_FILENO, "[vulkan] removed stray %s (a file, not a link)\n", path.UTF8String);
-            else if (dest && !ours)
-                dprintf(STDERR_FILENO, "[vulkan] %s is a link to %s; left in place\n", path.UTF8String, dest.UTF8String);
-            if (ours || stray)
+            if (dest && [dest rangeOfString:@"/vulkan/arm64ec-windows/"].location != NSNotFound)
                 [fm removeItemAtPath:path error:nil];
         }
 

@@ -18,7 +18,8 @@ log "Installing build dependencies"
 brew install cmake ninja meson pkg-config autoconf automake libtool bison flex sevenzip llvm
 export PATH="$(brew --prefix bison)/bin:$(brew --prefix llvm)/bin:$PATH"
 
-log "Submodules: none (FEX, wine, dxmt and madeira-dock are ordinary folders in Madeira_Test8)"
+log "Checking out submodules"
+git -C "$ROOT" submodule update --init --recursive
 
 log "Validating bundled Wine prefix"
 bash "$ROOT/tools/check-prefix-template.sh" "$ROOT/app/Madeira/prefix-template.tar.gz"

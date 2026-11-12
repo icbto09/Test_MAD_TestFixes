@@ -74,8 +74,8 @@ struct EAGamesSection: View {
         let others = items.filter { $0.installed == nil && ea.downloads[$0.id] == nil }
         // (new-look) Games to install come first (the Library tab already has the installed ones): what is
         // downloading stays on top, the installed games go under Not installed in a group that starts closed.
-        let top = NewLook.enabled ? mine.filter { ea.downloads[$0.id] != nil } : mine
-        let folded = NewLook.enabled ? mine.filter { ea.downloads[$0.id] == nil } : []
+        let top = mine.filter { ea.downloads[$0.id] != nil }
+        let folded = mine.filter { ea.downloads[$0.id] == nil }
         let collapsible = SteamGamesSection.collapsible
         VStack(alignment: .leading, spacing: 14) {
             LibrarySectionHeader(title: "EA app", count: mine.count, collapsed: collapsible ? $hidden : nil) {
@@ -104,7 +104,7 @@ struct EAGamesSection: View {
                         }.contentShape(Rectangle()).frame(minHeight: 44)
                     }.buttonStyle(.plain)
                         .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
-                        .padItem("ea-not-installed", cornerRadius: NewLook.enabled ? 16 : 12) { showUninstalled.toggle() }
+                        .padItem("ea-not-installed", cornerRadius: 16) { showUninstalled.toggle() }
                     if showUninstalled {
                         LibraryCells(items: others, layout: layout, width: width) { item, list, dense in cell(item, list: list, dense: dense) }
                     }
@@ -183,7 +183,7 @@ struct EASignInCard: View {
             }.padding(14)
                 .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
         }.buttonStyle(.plain)
-            .menuPad("signin:ea", cornerRadius: 16, action: signIn)
+            .padItem("signin:ea", cornerRadius: 16, press: signIn)
     }
 }
 
@@ -364,7 +364,7 @@ struct EAGameSheet: View {
                             VStack(alignment: .leading, spacing: 12) {
                                 Text(item.title).font(.title2.bold())
                                 primaryAction(item)
-                                    .menuPadSheet { primaryPress(item)?() }
+                                    .padSheet { primaryPress(item)?() }
                             }
                         }.padding(.vertical, 24)
                     }
@@ -421,7 +421,7 @@ struct EAGameSheet: View {
             case .paused:
                 Button { ea.install(offerID) } label: { steamActionLabel("Resume", symbol: "arrow.down.circle.fill") }.buttonStyle(.borderedProminent)
             case .failed:
-                Button { ea.install(offerID) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }.buttonStyle(.borderedProminent)
+                Button { ea.install(offerID) } label: { steamActionLabel("Try Again", symbol: "arrow.clockwise") }.buttonStyle(.borderedProminent)
             }
         } else if let installed = item.installed {
             Button {
@@ -437,7 +437,7 @@ struct EAGameSheet: View {
         }
     }
 
-    /// What A on a controller does on this sheet (MenuPad.swift): the same as the button above.
+    /// What A on a controller does on this sheet (PadHighlight.swift): the same as the button above.
     private func primaryPress(_ item: EAItem) -> (() -> Void)? {
         if let download = ea.downloads[offerID] {
             switch download.state {

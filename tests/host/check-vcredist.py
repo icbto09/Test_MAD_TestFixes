@@ -70,7 +70,9 @@ require('secondary("Set up later") { model.next() }' in page and "redist.install
         "setup page: Set up later, install through the model, says no session runs")
 require("case .vcRedist: vcRedistPage" in onboarding and "offerVCRedist = Self.vcRedistOffered()" in onboarding,
         "setup shows the page while the device lacks the runtime")
-require("VCRedistSettingsSection()" in library and "VCRedistModel.enabled" in library, "Settings: the section, behind the switch")
+# One UI (Nov 10): the long Settings page is gone; the section is on the Runtimes page.
+require("if VCRedistModel.enabled { VCRedistSettingsSection() }" in (APP / "SettingsPages.swift").read_text(encoding="utf-8"),
+        "Settings: the section, behind the switch")
 require('MadeiraConfig.flag("MADEIRA_VCREDIST")' in redist, "the feature switch is read through MadeiraConfig.flag")
 for forbidden in ["runWineFullSequence", "launchRequest", "wine_process_start", "MADEIRA_EXE", "install.cmd", "startSetupSession"]:
     require(forbidden not in redist, f"VCRedist.swift: no {forbidden} (no Wine session)")

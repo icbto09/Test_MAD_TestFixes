@@ -82,8 +82,9 @@ check(adv.index('Copy Compat Report') < adv.index('(game-actions-advanced)') < a
 for row in ['Button("Share Setup"', 'Button("Apply Shared Setup"', 'Button("Copy Settings"',
             'Button("Reset to Recommended"', 'GameRecommendations.note(recommended']:
     check(row in adv, f'Advanced page has {row}')
-body = lib[lib.index('struct LibraryDetail: View {'):]
-body = body[body.index('    var body: some View {'):body.index('.navigationTitle(stack == nil ? L("Game details") : entry.title)')]
+# One UI (Nov 10): the game's page is the new look's (the list in "MARK: - New look game page").
+body = lib[lib.index('// MARK: - New look game page'):]
+body = body[:body.index('\n// MARK: - ', 10)] if '\n// MARK: - ' in body[10:] else body
 check(all(r not in body for r in ['Button("Share Setup"', 'ClaudeHelpButton(', 'ShareLogsButton()', 'Button("Reset to Recommended"']),
       'Game details no longer lists them')
 

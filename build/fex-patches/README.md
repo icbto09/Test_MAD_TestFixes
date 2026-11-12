@@ -13,6 +13,7 @@ These patches are for Madeira only and are not to be sent to FEX-Emu.
 |---|---|
 | `0001-windows-ios-smc-traps-per-16k-host-page.patch` | Self-modifying-code write traps per 16 KB iOS host page, both modules (The Escapists 2, Project Zomboid) |
 | `0002-windows-skip-own-memory-notifications-during-invalidation.patch` | FEX's own frees during a code invalidation no longer re-enter the invalidation and deadlock on CodeBufferListLock, both modules (.NET games: Stardew Valley, Slay the Spire 2) |
+| `0003-windows-skip-own-code-flushes-under-the-invalidation-lock.patch` | FEX's own code flushes while it holds the code invalidation lock no longer wait for ThreadCreationMutex, which deadlocked against a write fault on another thread, ARM64EC module (PvZ Fusion with MelonLoader: black screen) |
 
 A patch must apply on the current FEX pin. When the pin moves, rebase the
 patches onto it (or drop a patch the new pin already covers).

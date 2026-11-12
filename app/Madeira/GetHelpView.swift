@@ -541,21 +541,6 @@ struct GetHelpStartScreen: ViewModifier {
     }
 }
 
-/// Game details: the Get Help row. LibraryDetail presents the sheet (getHelpSheet).
-struct GetHelpRow: View {
-    var open: () -> Void
-    var body: some View {
-        Button(action: open) {
-            HStack(spacing: 8) {
-                Label { Text("Get Help").foregroundStyle(.primary) } icon: { Image(systemName: "lifepreserver").foregroundStyle(Color.accentColor) }
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
-            }
-            .contentShape(Rectangle())
-        }
-    }
-}
-
 extension View {
     /// The Get Help sheet for one game (Game details); `closed` runs when it goes away.
     func getHelpSheet(_ open: Binding<Bool>, entry: LibraryEntry, closed: @escaping () -> Void) -> some View {
@@ -694,6 +679,8 @@ enum DiscordLog {
 /// report.txt (what Get Help read), game-run.txt (the game's whole last run), madeira-log.txt,
 /// madeira.cfg.txt, game-config.txt (that game's config and switches), device.txt and
 /// files.txt (the game folder's file names and sizes, for missing DLLs or a wrong exe).
+/// (late-zip) Until the server answers, the zip and what makes it wait in Application Support/
+/// get-help-pending/; the next open sends what Madeira closed before sending (resendLate).
 enum GetHelpUpload {
     /// Sentry takes at most 40 MB per compressed upload; this leaves room for the report.
     static let maxZip = 38 * 1024 * 1024
@@ -707,30 +694,155 @@ enum GetHelpUpload {
     static func send(requestID: String, title: String, windowsPath: String, report: String, gameText: String?) {
         guard let key = GetHelp.key else { return }
         let device = ClaudeHelp.deviceLine() + "\nMadeira " + BuildStamp.text
+        // (late-zip) Claimed before anything else, so the launch resend never sends this id at the same time.
+        guard GetHelpCore.Late.safeID(requestID), claim(requestID) else { return }
+        let pending = GetHelpCore.Pending(requestID: requestID, title: title, windowsPath: windowsPath, report: report,
+                                          gameText: gameText, device: device, created: Date())
         DispatchQueue.global(qos: .utility).async {
+            // (late-zip) What make() needs, saved BEFORE any waiting or zipping: if Madeira closes
+            // (or iOS ends it) now, the next open makes the zip from this and sends it.
+            savePending(pending)
             // (log-fixes) A log taken while Wine still runs (Get Help right after Quit, or a frozen
             // game) has no end: wait for it, up to waitForEnd seconds; still running then, say so.
             var waited = 0
             while LogTrail.isRunning(title), waited < waitForEnd { Thread.sleep(forTimeInterval: 5); waited += 5 }
             let running = LogTrail.isRunning(title)
             if waited > 0 { LogStore.shared.log("[get-help] upload waited \(waited) s for \(title)'s end\(running ? "; still running" : "")") }
-            let zip = make(title: title, windowsPath: windowsPath, report: report, gameText: gameText, device: device,
-                           stillRunning: running)
-            var request = URLRequest(url: GetHelpCore.server.appendingPathComponent("upload"), timeoutInterval: 300)
-            request.httpMethod = "POST"
-            request.setValue(key, forHTTPHeaderField: "x-madeira-key")
-            request.setValue(requestID, forHTTPHeaderField: "x-request-id")
-            request.setValue("application/zip", forHTTPHeaderField: "content-type")
-            let size = zip.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int } ?? 0
-            // No zip (it failed): an empty upload still sends the report to Sentry.
-            let done: (Data?, URLResponse?, Error?) -> Void = { _, response, error in
-                let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let made = make(title: title, windowsPath: windowsPath, report: report, gameText: gameText, device: device,
+                            stillRunning: running)
+            // (late-zip) The zip waits in the pending folder until the server has it.
+            let zip = made.map { keepZip($0, requestID) }
+            upload(zip: zip, requestID: requestID, key: key) { status, error in
+                let size = zip.flatMap { try? FileManager.default.attributesOfItem(atPath: $0.path)[.size] as? Int } ?? 0
                 LogStore.shared.log("[get-help] upload: \(size) bytes, HTTP \(status)\(error.map { ", \($0)" } ?? "")",
                                     level: status == 200 ? .info : .error)
-                if let zip { try? FileManager.default.removeItem(at: zip) }
+                settle(requestID, status: status)
             }
-            if let zip { URLSession.shared.uploadTask(with: request, fromFile: zip, completionHandler: done).resume() }
-            else { URLSession.shared.uploadTask(with: request, from: Data(), completionHandler: done).resume() }
+        }
+    }
+
+    /// POST /upload of one zip (nil: an empty upload, which still sends the report to Sentry).
+    /// `done` gets the HTTP status (0: no answer) on URLSession's queue.
+    private static func upload(zip: URL?, requestID: String, key: String, done: @escaping (Int, Error?) -> Void) {
+        var request = URLRequest(url: GetHelpCore.server.appendingPathComponent("upload"), timeoutInterval: 300)
+        request.httpMethod = "POST"
+        request.setValue(key, forHTTPHeaderField: "x-madeira-key")
+        request.setValue(requestID, forHTTPHeaderField: "x-request-id")
+        request.setValue("application/zip", forHTTPHeaderField: "content-type")
+        let finish: (Data?, URLResponse?, Error?) -> Void = { _, response, error in
+            done((response as? HTTPURLResponse)?.statusCode ?? 0, error)
+        }
+        if let zip { URLSession.shared.uploadTask(with: request, fromFile: zip, completionHandler: finish).resume() }
+        else { URLSession.shared.uploadTask(with: request, from: Data(), completionHandler: finish).resume() }
+    }
+
+    // MARK: Late zip (late-zip)
+
+    /// (late-zip) Application Support/get-help-pending/: <id>.json and <id>.zip until the server has them.
+    static var pendingFolder: URL? {
+        guard let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return nil }
+        let folder = base.appendingPathComponent(GetHelpCore.Late.folderName, isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        return folder
+    }
+
+    /// (late-zip) The ids being uploaded in this run of Madeira: never two uploads of one id at once.
+    private static let inFlightLock = NSLock()
+    nonisolated(unsafe) private static var inFlight = Set<String>()
+    private static func claim(_ id: String) -> Bool {
+        inFlightLock.lock(); defer { inFlightLock.unlock() }
+        return inFlight.insert(id).inserted
+    }
+    private static func release(_ id: String) {
+        inFlightLock.lock(); defer { inFlightLock.unlock() }
+        inFlight.remove(id)
+    }
+    private static func claimed(_ id: String) -> Bool {
+        inFlightLock.lock(); defer { inFlightLock.unlock() }
+        return inFlight.contains(id)
+    }
+
+    private static func savePending(_ pending: GetHelpCore.Pending) {
+        guard let folder = pendingFolder, let data = GetHelpCore.Late.encode(pending) else { return }
+        do { try data.write(to: folder.appendingPathComponent(GetHelpCore.Late.jsonName(pending.requestID)), options: .atomic) }
+        catch { LogStore.shared.log("[get-help] could not keep the upload for later: \(error.localizedDescription)", level: .error) }
+    }
+
+    /// The made zip moved into the pending folder as <id>.zip; where it was, if it can't be moved.
+    private static func keepZip(_ made: URL, _ id: String) -> URL {
+        guard let folder = pendingFolder else { return made }
+        let target = folder.appendingPathComponent(GetHelpCore.Late.zipName(id))
+        try? FileManager.default.removeItem(at: target)
+        do { try FileManager.default.moveItem(at: made, to: target); return target } catch { return made }
+    }
+
+    private static func removePending(_ id: String) {
+        guard let folder = pendingFolder else { return }
+        for name in [GetHelpCore.Late.jsonName(id), GetHelpCore.Late.zipName(id)] {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+        }
+    }
+
+    /// After an upload: a final answer deletes the pending files, no answer keeps them for the next open.
+    private static func settle(_ id: String, status: Int) {
+        switch GetHelpCore.Late.verdict(status: status) {
+        case .done:
+            removePending(id)
+            LogStore.shared.log("[get-help] upload \(GetHelpCore.Late.short(id)) done (HTTP \(status)): pending files deleted")
+        case .keep:
+            LogStore.shared.log("[get-help] upload kept for next open")
+        }
+        release(id)
+    }
+
+    /// (late-zip) On app start, a few seconds after launch, in the background: zips that did not
+    /// reach the server (Madeira closed or was ended first) go now, made again from the saved
+    /// report when there is no zip. At most 3 per launch, one at a time; older than a week or
+    /// unreadable: deleted. No key: nothing.
+    static func resendLate() { _ = resendOnce }
+    /// Once per run of Madeira, even when the window shows again.
+    private static let resendOnce: Void = {
+        guard GetHelp.enabled, GetHelp.key != nil else { return }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + GetHelpCore.Late.startDelay) { resendLateNow() }
+    }()
+
+    private static func resendLateNow() {
+        guard let key = GetHelp.key, let folder = pendingFolder,
+              let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return }
+        var items: [String: GetHelpCore.Pending?] = [:]
+        for name in names {
+            guard let id = GetHelpCore.Late.id(fromFileName: name) else {
+                try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))   // not ours
+                continue
+            }
+            if claimed(id) || items[id] != nil { continue }
+            let json = folder.appendingPathComponent(GetHelpCore.Late.jsonName(id))
+            items[id] = .some((try? Data(contentsOf: json)).flatMap(GetHelpCore.Late.decode))
+        }
+        let plan = GetHelpCore.Late.plan(items)
+        for id in plan.delete {
+            removePending(id)
+            LogStore.shared.log("[get-help] late zip \(GetHelpCore.Late.short(id)) deleted: older than a week or unreadable")
+        }
+        for pending in plan.send {
+            let id = pending.requestID
+            guard claim(id) else { continue }
+            let zipURL = folder.appendingPathComponent(GetHelpCore.Late.zipName(id))
+            var zip: URL? = FileManager.default.fileExists(atPath: zipURL.path) ? zipURL : nil
+            if zip == nil {
+                // Madeira closed while it waited or zipped: make the zip now from what was saved.
+                zip = make(title: pending.title, windowsPath: pending.windowsPath, report: pending.report,
+                           gameText: pending.gameText, device: pending.device).map { keepZip($0, id) }
+            }
+            // One at a time: wait for this upload's answer before the next.
+            let finished = DispatchSemaphore(value: 0)
+            upload(zip: zip, requestID: id, key: key) { status, error in
+                LogStore.shared.log("[get-help] resent late zip \(GetHelpCore.Late.short(id)): HTTP \(status)\(error.map { ", \($0)" } ?? "")",
+                                    level: GetHelpCore.Late.verdict(status: status) == .done ? .info : .error)
+                settle(id, status: status)
+                finished.signal()
+            }
+            finished.wait()
         }
     }
 

@@ -479,7 +479,7 @@ struct SteamGamesSection: View {
 
     /// MADEIRA_LIBRARY_COLLAPSE=0: the section titles do not collapse.
     /// (new-look) Never in the new look: a store's page always shows its games.
-    static var collapsible: Bool { !NewLook.enabled && MadeiraConfig.flag("MADEIRA_LIBRARY_COLLAPSE") }
+    static var collapsible: Bool { false }
     private var libraryEnabled: Bool { SteamOwnedLibrary.enabled }
 
     /// Whether the library shows this section, and with it the sectioned
@@ -547,7 +547,7 @@ struct SteamGamesSection: View {
         let installed = SteamGamesRules.sorted(groups.installed, by: sort, recorded: recorded)
         // (new-look) Games to install come first (the Library tab already has the installed ones): what is
         // downloading stays on top, the installed games go under Not installed in a group that starts closed.
-        let fold = NewLook.enabled && part == .all
+        let fold = part == .all
         let top = fold ? groups.downloading : groups.downloading + installed
         let collapsible = Self.collapsible
         Group {
@@ -609,7 +609,7 @@ struct SteamGamesSection: View {
                             }.contentShape(Rectangle()).frame(minHeight: 44)
                         }.buttonStyle(.plain)
                             .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
-                            .padItem("steam-not-installed", cornerRadius: NewLook.enabled ? 16 : 12) { showUninstalled.toggle() }
+                            .padItem("steam-not-installed", cornerRadius: 16) { showUninstalled.toggle() }
                         if showUninstalled {
                             LibraryCells(items: groups.notInstalled, layout: layout, width: width) { item, list, dense in
                                 cell(item, list: list, dense: dense)
@@ -695,7 +695,7 @@ struct SteamSignInCard: View {
             }.padding(14)
                 .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
         }.buttonStyle(.plain)
-            .menuPad("signin:steam", cornerRadius: 16, action: signIn)
+            .padItem("signin:steam", cornerRadius: 16, press: signIn)
     }
 }
 
@@ -859,10 +859,7 @@ struct SteamGameCell: View {
                         .overlay { overlay(download) }
                         .overlay { if notDownloaded { notDownloadedFace(.largeTitle) } }
                         .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .modifier(LibraryCardArtworkPress { pressed, bounds in
-                            AmbientGlowItem(id: "steam-\(item.id)", seed: item.id, art: .steam(item.id), dimmed: notDownloaded,
-                                            pressed: pressed, bounds: bounds)
-                        })
+                        .modifier(LibraryCardArtworkPress())
                     Text(item.name).font(.subheadline.weight(.semibold)).lineLimit(2)
                     pills(status, entry)
                     if let played = steam.playtime[item.id]?.played {
@@ -1223,7 +1220,7 @@ struct SteamGameSheet: View {
                                     Text(summary).font(.subheadline).foregroundStyle(.secondary)
                                 }
                                 primaryAction(item)
-                                    .menuPadSheet { primaryPress(item)?() }
+                                    .padSheet { primaryPress(item)?() }
                             }
                         }.padding(.vertical, 24)
                             .listRowBackground(
@@ -1323,7 +1320,7 @@ struct SteamGameSheet: View {
                 Button { steam.install(appID) } label: { steamActionLabel("Resume", symbol: "arrow.down.circle.fill") }
                     .buttonStyle(.borderedProminent)
             case .failed:
-                Button { steam.install(appID) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }
+                Button { steam.install(appID) } label: { steamActionLabel("Try Again", symbol: "arrow.clockwise") }
                     .buttonStyle(.borderedProminent)
             }
         } else if item.owned != nil {
@@ -1333,7 +1330,7 @@ struct SteamGameSheet: View {
         }
     }
 
-    /// What A on a controller does on this sheet (MenuPad.swift): the same as the button above.
+    /// What A on a controller does on this sheet (PadHighlight.swift): the same as the button above.
     private func primaryPress(_ item: SteamGamesRules.Item) -> (() -> Void)? {
         if let installed = item.installed {
             // The download finished (or Steam's client installed the game): its Game details page.
@@ -1473,7 +1470,7 @@ struct SteamCloudSection: View {
                 ProgressView(value: Double(done), total: Double(max(total, 1))) { Text("Uploading \(done) of \(total)") }
             case .failed(let message):
                 Text(message).font(.callout).foregroundStyle(.orange)
-                Button("Try again") { Task { await steam.syncCloud(appID) } }
+                Button("Try Again") { Task { await steam.syncCloud(appID) } }
             case .ready:
                 ready(state)
             }

@@ -70,7 +70,8 @@ require("ensureLoopback" in coordinator_enable and "self?.enableResolved" in coo
         and "enableBuiltIn(completion: completion)" in coordinator_route
         and setup.count("StikJITHelper.enableJIT") == 1,
         "the coordinator routes each selected JIT method once, after the loopback check")
-require("JITSetupView()" in content and "JITSettingsSection()" in library,
+# One UI (Nov 10): the long Settings page is gone; JIT has its own Settings page.
+require("JITSetupView()" in content and "case .jit: JITSettingsSection()" in (app / "SettingsPages.swift").read_text(encoding="utf-8"),
         "JIT setup is reachable from the main flow and Settings")
 require('dictionary["public_key"]' in setup
         and 'dictionary["private_key"]' in setup
@@ -160,7 +161,7 @@ require("if let jitProblem { jitConnectionActions(jitProblem, retry: enableJIT) 
 # The error alert hangs off LibraryView's tab view, so it presents from Settings too
 # (an alert inside the Library page waited until that tab came back).
 body = library_source[library_source.index('struct LibraryView: View {'):]
-body = body[body.index('    var body: some View {'):body.index('    @ToolbarContentBuilder private var libraryToolbar')]
+body = body[body.index('    var body: some View {'):body.index('    static var runtimeSettingsShown: Bool')]
 require('.alert(jitProblem == nil ? L("Library") : L("Couldn\'t Enable JIT")' in body,
         "the library's error alert is on the tab view, shown on the Settings tab as well")
 require('URL(string: "localdevvpn://enable?scheme=madeira")' in setup
@@ -181,10 +182,11 @@ require("launchAfterJIT = nil" in ended
         and "guard started, StikJITHelper.ready, library.current == nil, wine_process_is_running() == 0 else {" in ended
         and ended.index("launchAfterJIT = nil") < ended.index("library.startingJIT = nil") < ended.index("launch()"),
         "the waiting game starts once, only when JIT came on and nothing else started")
-require('if model.startingJIT == entry.id {' in library and 'Text("Starting JIT")' in library and 'ProgressView()' in library
-        and "if selected?.id == entry.id, model.startingJIT != entry.id { selected = nil }" in library
+# One UI (Nov 10): the game's page is pushed inside its tab and stays there (the old cover's
+# 15 s close is gone with the cover), so only JIT setup puts it away.
+require('let playing = model.startingJIT == entry.id' in library and 'Text("Starting JIT")' in library and 'ProgressView()' in library
         and ".onChange(of: jit.showSetup) { _, show in if show { selected = nil } }" in library,
-        "the Play button reads Starting JIT with a spinner meanwhile; the details page stays up for it, "
+        "the Play button reads Starting JIT with a spinner meanwhile; the game's page stays up for it, "
         "and closes for JIT setup")
 enable_jit = function(content, "private func enableJIT()")
 require(enable_jit.count("launchAfterJITEnded(started: false)") == 2 and enable_jit.count("launchAfterJITEnded(started: true)") == 1,

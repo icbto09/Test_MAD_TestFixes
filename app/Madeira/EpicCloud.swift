@@ -357,7 +357,7 @@ struct EpicCloudSection: View {
             HStack(spacing: 10) { ProgressView(); Text("Uploading saves…").foregroundStyle(.secondary) }
         case .failed(let message):
             Text(message).font(.callout).foregroundStyle(.orange)
-            Button("Try again") { Task { await cloud.check(appName, automatic: false) } }
+            Button("Try Again") { Task { await cloud.check(appName, automatic: false) } }
         case .unsupported:
             EmptyView()
         case .ready:

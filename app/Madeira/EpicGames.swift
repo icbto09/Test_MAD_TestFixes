@@ -77,8 +77,8 @@ struct EpicGamesSection: View {
         let others = items.filter { $0.installed == nil && epic.downloads[$0.id] == nil }
         // (new-look) Games to install come first (the Library tab already has the installed ones): what is
         // downloading stays on top, the installed games go under Not installed in a group that starts closed.
-        let top = NewLook.enabled ? mine.filter { epic.downloads[$0.id] != nil } : mine
-        let folded = NewLook.enabled ? mine.filter { epic.downloads[$0.id] == nil } : []
+        let top = mine.filter { epic.downloads[$0.id] != nil }
+        let folded = mine.filter { epic.downloads[$0.id] == nil }
         let collapsible = SteamGamesSection.collapsible
         VStack(alignment: .leading, spacing: 14) {
             LibrarySectionHeader(title: "Epic Games", count: mine.count, collapsed: collapsible ? $hidden : nil) {
@@ -107,7 +107,7 @@ struct EpicGamesSection: View {
                         }.contentShape(Rectangle()).frame(minHeight: 44)
                     }.buttonStyle(.plain)
                         .accessibilityValue(showUninstalled ? "Shown" : "Hidden")
-                        .padItem("epic-not-installed", cornerRadius: NewLook.enabled ? 16 : 12) { showUninstalled.toggle() }
+                        .padItem("epic-not-installed", cornerRadius: 16) { showUninstalled.toggle() }
                     if showUninstalled {
                         LibraryCells(items: others, layout: layout, width: width) { item, list, dense in cell(item, list: list, dense: dense) }
                     }
@@ -186,7 +186,7 @@ struct EpicSignInCard: View {
             }.padding(14)
                 .background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
         }.buttonStyle(.plain)
-            .menuPad("signin:epic", cornerRadius: 16, action: signIn)
+            .padItem("signin:epic", cornerRadius: 16, press: signIn)
     }
 }
 
@@ -364,7 +364,7 @@ struct EpicGameSheet: View {
                             VStack(alignment: .leading, spacing: 12) {
                                 Text(item.title).font(.title2.bold())
                                 primaryAction(item)
-                                    .menuPadSheet { primaryPress(item)?() }
+                                    .padSheet { primaryPress(item)?() }
                             }
                         }.padding(.vertical, 24)
                     }
@@ -409,7 +409,7 @@ struct EpicGameSheet: View {
             case .paused:
                 Button { epic.install(appName) } label: { steamActionLabel("Resume", symbol: "arrow.down.circle.fill") }.buttonStyle(.borderedProminent)
             case .failed:
-                Button { epic.install(appName) } label: { steamActionLabel("Try again", symbol: "arrow.clockwise") }.buttonStyle(.borderedProminent)
+                Button { epic.install(appName) } label: { steamActionLabel("Try Again", symbol: "arrow.clockwise") }.buttonStyle(.borderedProminent)
             }
         } else if let installed = item.installed {
             Button {
@@ -425,7 +425,7 @@ struct EpicGameSheet: View {
         }
     }
 
-    /// What A on a controller does on this sheet (MenuPad.swift): the same as the button above.
+    /// What A on a controller does on this sheet (PadHighlight.swift): the same as the button above.
     private func primaryPress(_ item: EpicItem) -> (() -> Void)? {
         if let download = epic.downloads[appName] {
             switch download.state {

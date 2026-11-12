@@ -3,17 +3,11 @@
 
 import SwiftUI
 
-// Settings in pages, as Game details is: the Settings tab lists a few groups of rows,
-// and each row opens a page with the sections that were on the one long page. Each
-// section is the same view it was there. While the search field holds text, the tab
-// shows the one long page filtered, as before, so a match is found wherever it lives.
-// env.MADEIRA_SETTINGS_PAGES = 0 keeps the one long page.
+// Settings in pages: the Settings tab (NewLookSettingsList) lists a few groups of rows, and
+// each row opens a page (SettingsPageView) with its sections. The Search tab finds a page by
+// its name or what it is for.
 
 enum SettingsPages {
-    /// On by default: the Settings tab lists its pages, each opening the sections it holds.
-    /// 0: the one long page with every section, as before.
-    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_SETTINGS_PAGES") }
-
     enum Page: Hashable, CaseIterable {
         case steam, gog, itch, epic, ea, runtimes, displayGraphics, memory, pointer, jit, signing, saves, drives,
              appearance, advanced, logs, credits
@@ -62,10 +56,10 @@ enum SettingsPages {
             }
         }
 
-        /// The page's name for the iPad layout's stored choice.
+        /// The page's name in ids (the controller's highlight, Search).
         var key: String { String(describing: self) }
 
-        /// The colour of the page's icon square on iPad (SettingsSplit).
+        /// The colour of the page's icon square.
         var color: Color {
             func rgb(_ value: Int) -> Color { Color(red: Double(value >> 16) / 255, green: Double(value >> 8 & 0xff) / 255, blue: Double(value & 0xff) / 255) }
             switch self {
@@ -87,7 +81,7 @@ enum SettingsPages {
             }
         }
 
-        /// One line under the page's title on iPad, saying what the page is for.
+        /// One line saying what the page is for (Search shows it under the page's name).
         var blurb: String {
             switch self {
             case .steam: return L("Sign in to Steam and start games with Madeira Dock.")
@@ -103,14 +97,14 @@ enum SettingsPages {
             case .signing: return L("When this copy of Madeira needs signing again.")
             case .saves: return L("Back up your game saves and bring them back.")
             case .drives: return L("Keep games on an external drive.")
-            case .appearance: return L("How Madeira looks: the library's store sidebar, the bars, and the touch buttons in games.")
+            case .appearance: return L("The size of the Library's covers, and the touch buttons in games.")
             case .advanced: return L("Logs, help and every option, for when something goes wrong.")
             case .logs: return L("What Madeira and your games wrote while running.")
             case .credits: return L("The people and projects Madeira is built on.")
             }
         }
 
-        // A page shows when the long page would show its sections: the same switches.
+        // A page shows when its sections would: the same switches.
         @MainActor var shown: Bool {
             switch self {
             case .steam: return SteamSettingsSection.shown
@@ -127,17 +121,9 @@ enum SettingsPages {
         }
     }
 
-    /// The rows of the Settings tab, in groups.
+    /// The Settings tab's rows, in short groups, games first. Signing in to a store is also on
+    /// the Stores tab, so the stores come lower down.
     static let groups: [(String?, [Page])] = [
-        ("Getting games", [.steam, .gog, .itch, .epic, .ea, .runtimes]),
-        ("Running games", [.displayGraphics, .memory, .pointer]),
-        ("Device", [.jit, .signing, .saves, .drives]),
-        (nil, [.appearance, .advanced, .logs, .credits]),
-    ]
-
-    /// The new look's Settings tab: short groups as in its mock-up, games first. Signing in to a
-    /// store is also on the Stores tab, so the stores come lower down.
-    static let newLookGroups: [(String?, [Page])] = [
         ("Games", [.displayGraphics, .memory, .pointer, .runtimes]),
         ("Storage", [.saves, .drives]),
         ("This device", [.jit, .signing]),
@@ -148,71 +134,23 @@ enum SettingsPages {
     ]
 }
 
-/// The Settings tab's first page: the status, then a row for each page.
-struct SettingsPagesList: View {
-    var startDock: (DockGame, Bool) -> Void
-    @ObservedObject private var jitState = LibraryJITState.shared
-    @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
-
-    var body: some View {
-        Form {
-            Section { LibraryStatus().listRowBackground(Color.clear) }
-            ForEach(Array(SettingsPages.groups.enumerated()), id: \.offset) { _, group in
-                let pages = group.1.filter(\.shown)
-                if !pages.isEmpty {
-                    Section {
-                        ForEach(pages, id: \.self) { page in
-                            NavigationLink { SettingsPageView(page: page, startDock: startDock) } label: { row(page) }
-                        }
-                    } header: { if let title = group.0 { Text(title) } }
-                }
-            }
-        }
-    }
-
-    @ViewBuilder private func row(_ page: SettingsPages.Page) -> some View {
-        if let value = summary(page) {
-            LabeledContent { Text(value).lineLimit(1) } label: { Label(page.title, systemImage: page.symbol) }
-        } else {
-            Label(page.title, systemImage: page.symbol)
-        }
-    }
-
-    private func summary(_ page: SettingsPages.Page) -> String? {
-        switch page {
-        case .jit: return jitState.enabled ? "On" : "Off"
-        case .appearance: return liquidMetal.on ? "Liquid metal" : "Liquid Glass"
-        default: return nil
-        }
-    }
-}
-
-/// One page. Its sheets hang off its own Form, as the long page's did, never off a
-/// page the navigation has covered.
+/// One page. Its sheets hang off its own Form, never off a page the navigation has covered.
 struct SettingsPageView: View {
     let page: SettingsPages.Page
     var startDock: (DockGame, Bool) -> Void
-    /// On iPad (SettingsSplit): a card with the page's icon, title and what it is for, first.
-    var header = false
     @State private var sheet: SettingsSheet?
     @State private var refresh = 0
     @ObservedObject private var input = InputSettings.shared
-    @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
-    @AppStorage(LibraryGridArm.key) private var zoomableGrid = false
-    @AppStorage(GridZoomHapticPlayer.key) private var zoomHaptics = true
-    @AppStorage(NewLook.key) private var newLookOn = true
+    @AppStorage(NewLook.zoomHapticsKey) private var zoomHaptics = true
     @AppStorage(NewLook.coverWidthKey) private var coverWidth: Double = 104
     @AppStorage(TouchControlStyle.key) private var controlStyle = "glass"
     @State private var developerUI = !FrontendChoice.preferNew
     @State private var restartNotice = false
 
     var body: some View {
-        Form {
-            if header { SettingsPageHeader(page: page) }
-            content
-        }
+        Form { content }
             .navigationTitle(page.title).navigationBarTitleDisplayMode(.inline)
-            // (new-look) The island behind the page, and B goes back.
+            // B goes back.
             .modifier(NewLookSettingsChrome())
             .alert("Restart Madeira", isPresented: $restartNotice) {
                 Button("OK", role: .cancel) {}
@@ -230,8 +168,8 @@ struct SettingsPageView: View {
                     case .dock: MadeiraDockView(start: startDock)
                     }
                 }
-                // A controller's B closes it, and the Settings list leaves the pad alone meanwhile.
-                .menuPadSheet()
+                // A controller's B closes it.
+                .padSheet()
                 .logScreen("Settings sheet: \(String(describing: sheet))")
             }
     }
@@ -281,40 +219,24 @@ struct SettingsPageView: View {
 
     @ViewBuilder private var appearance: some View {
         Section {
-            Toggle("Liquid metal", isOn: $liquidMetal.on)
-        } footer: {
-            Text("Flowing chrome on the bars and the Desktop button. Off, they use the system's Liquid Glass.")
+            // The Library's covers; a pinch on them changes it too. A on it steps to the next size.
+            Picker("Cover size", selection: Binding(get: { NewLook.coverStep(coverWidth) },
+                                                    set: { coverWidth = NewLook.coverWidths[$0] })) {
+                Text("Small").tag(0)
+                Text("Medium").tag(1)
+                Text("Large").tag(2)
+            }
+            .padItem("ap-cover-size", cornerRadius: 12) { coverWidth = NewLook.coverWidths[(NewLook.coverStep(coverWidth) + 1) % 3] }
+            Toggle("Zoom haptics", isOn: $zoomHaptics)
+        } header: { Text("Library") } footer: {
+            Text("Pinch the Library's covers to change how many fit across. Zoom haptics click as the pinch crosses a size.")
         }
         Section {
             Picker("Touch control buttons", selection: $controlStyle) {
                 ForEach(TouchControlStyle.styles, id: \.id) { Text($0.name).tag($0.id) }
             }
-        } footer: {
+        } header: { Text("In games") } footer: {
             Text("Glass is the system's Liquid Glass. Solid draws each button as a plain opaque disc; a game's Opacity slider still fades them.")
-        }
-        Section {
-            // The new look (NewLook.swift), on unless env.MADEIRA_NEW_LOOK = 0.
-            if NewLook.allowed {
-                Toggle("New look", isOn: $newLookOn)
-                if newLookOn {
-                    // (new-look) The Library's covers; a pinch on them changes it too. A on it steps to the next size.
-                    Picker("Cover size", selection: Binding(get: { NewLook.coverStep(coverWidth) },
-                                                            set: { coverWidth = NewLook.coverWidths[$0] })) {
-                        Text("Small").tag(0)
-                        Text("Medium").tag(1)
-                        Text("Large").tag(2)
-                    }
-                    .padItem("ap-cover-size", cornerRadius: 12) { coverWidth = NewLook.coverWidths[(NewLook.coverStep(coverWidth) + 1) % 3] }
-                }
-            }
-            Toggle("New library grid", isOn: $zoomableGrid)
-            if zoomableGrid {
-                Toggle("Zoom haptics", isOn: $zoomHaptics)
-            }
-        } footer: {
-            Text(NewLook.allowed
-                 ? L("New look: a tab bar, every installed game on one page, the Madeira island behind it and one controller highlight. Off, the library is one page with store tabs, as before. New library grid applies only with New look off: pinch the cards to change how many fit across. Zoom haptics click as the pinch crosses a size.")
-                 : L("Pinch the library's cards to change how many fit across. Off, the cards use the original grid. Zoom haptics click as the pinch crosses a size."))
         }
         Section {
             Toggle("Use developer interface", isOn: Binding(get: { developerUI }, set: { on in
@@ -326,36 +248,7 @@ struct SettingsPageView: View {
     }
 }
 
-/// A page's square icon on its colour, as in the iPad's own Settings app.
-struct SettingsPageIcon: View {
-    let page: SettingsPages.Page
-    var size: CGFloat = 28
-    var body: some View {
-        Image(systemName: page.symbol)
-            .font(.system(size: size * 0.5, weight: .semibold)).foregroundStyle(.white)
-            .frame(width: size, height: size)
-            .background(page.color, in: RoundedRectangle(cornerRadius: size * 0.26, style: .continuous))
-            .accessibilityHidden(true)
-    }
-}
-
-/// The card at the top of a page on iPad: the big icon, the title and what the page is for.
-struct SettingsPageHeader: View {
-    let page: SettingsPages.Page
-    var body: some View {
-        Section {
-            VStack(spacing: 8) {
-                SettingsPageIcon(page: page, size: 58)
-                Text(page.title).font(.title2.bold()).accessibilityAddTraits(.isHeader)
-                Text(page.blurb).font(.subheadline).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity).padding(.vertical, 10)
-        }
-    }
-}
-
-/// The credits, on their own page and last on the long one.
+/// The credits.
 struct SettingsCreditsSection: View {
     var body: some View {
         Section {

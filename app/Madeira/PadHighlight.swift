@@ -4,8 +4,9 @@
 import SwiftUI
 import UIKit
 import Combine
+import GameController
 
-// The new look's controller (NewLook.swift): Madeira owns one highlight, on every screen.
+// The controller in Madeira's own screens (NewLook.swift): Madeira owns one highlight, on every screen.
 // The pad is player 1's, read by GamepadInput and turned into commands by LibraryController,
 // so it only reaches Madeira's own screens while no game has the pad.
 //
@@ -16,17 +17,19 @@ import Combine
 //   Y / View            Search
 //   LB / RB             the previous or next tab
 //   LT / RT             a page up or down
-//   Menu                the highlighted game's options
+//   Menu                the highlighted game's page (its settings)
 //
 // Layers: a screen or sheet over another one (the game page, a question, the options) is a
 // layer. Only the top layer's items can be highlighted, the layer starts on its own safe
 // item, and when it goes the highlight returns to the item it came from. The first press
 // only shows the highlight; touching the screen hides it. env.MADEIRA_NEW_LOOK_PAD = 0 turns
-// the highlight off (the new look's screens then work by touch only).
+// the highlight off (Madeira's screens then work by touch only).
 
 @MainActor final class PadHighlight: ObservableObject {
     static let shared = PadHighlight()
-    static var enabled: Bool { NewLook.enabled && MadeiraConfig.flag("MADEIRA_NEW_LOOK_PAD") }
+    static var enabled: Bool { MadeiraConfig.flag("MADEIRA_NEW_LOOK_PAD") }
+    /// Sheets open over the tabs (a store game's sheet, a Settings sheet), for the log trail.
+    var sheets = 0
 
     /// The highlight is showing: the controller was used since the last touch.
     @Published private(set) var shown = false
@@ -91,7 +94,7 @@ import Combine
     private var started = false
     private var bag: AnyCancellable?
 
-    /// Listens to the controller's commands once, while the new look is on.
+    /// Listens to the controller's commands, once.
     func start() {
         guard !started, Self.enabled else { return }
         started = true
@@ -347,6 +350,9 @@ import Combine
         // (its own A and B; an A there must not press Stop behind it).
         let model = LibraryModel.shared
         guard Self.enabled, model.current == nil || model.startingScreen, !model.menu else { return }
+        // First-run setup covers the library: no command acts on what is behind it (the old
+        // library's commands had the same guard).
+        guard !OnboardingModel.shared.presented else { return }
         // The first press of a direction or A only brings the highlight back (where it was).
         // A layer with nothing to highlight (a store game's sheet) takes A as its own accept.
         if command == "accept", let accept = top.accept, !items.values.contains(where: { $0.layer == top.name }) {
@@ -472,7 +478,6 @@ struct PadItem: ViewModifier {
     /// PadHighlight: a move or a tab switch redraws the one or two items that changed, not every
     /// item in every tab and pushed page (Cameron, Test 6: tab switching got laggy over time).
     @State private var on = false
-    @Environment(\.colorScheme) private var scheme
     func body(content: Content) -> some View {
         content
             .overlay {
@@ -480,10 +485,10 @@ struct PadItem: ViewModifier {
                 // line up"): the same shape, moved out or in by `inset`, corners changed by the same amount.
                 Group {
                     if capsule {
-                        Capsule().strokeBorder(NewLookColor.ring(scheme), lineWidth: 3)
+                        Capsule().strokeBorder(Color.accentColor, lineWidth: 3)
                     } else {
                         RoundedRectangle(cornerRadius: max(0, cornerRadius - inset), style: .continuous)
-                            .strokeBorder(NewLookColor.ring(scheme), lineWidth: 3)
+                            .strokeBorder(Color.accentColor, lineWidth: 3)
                     }
                 }
                 .padding(inset)
@@ -576,4 +581,134 @@ extension View {
     @ViewBuilder func padScrollFollow(_ reader: ScrollViewProxy, toTop: Set<String> = []) -> some View {
         if PadHighlight.enabled { modifier(PadScrollFollow(reader: reader, toTop: toTop)) } else { self }
     }
+}
+
+// MARK: - Sheets, Forms and store cards
+
+/// iPadOS walks a Form with the controller through its own focus: one A on a cover opened the
+/// game's page, then Controls and Gyro aim & turbo opened by themselves and the walk ended at the
+/// bottom (Cameron, Wave 10, after the window's claim). While a controller is connected the
+/// Form's list takes no system focus; touch, and Madeira's own commands, work as before.
+struct PadNoSystemFocus: UIViewRepresentable {
+    func makeUIView(context: Context) -> Probe { Probe() }
+    func updateUIView(_ view: Probe, context: Context) {}
+
+    /// Wave 12 (Cameron's log): the list's cells took the system focus even with allowsFocus
+    /// off, and its blue fill walked under Madeira's highlight. So this view also holds the
+    /// system focus itself while the highlight shows: it is focusable, draws nothing, takes the
+    /// focus whenever it lands elsewhere in its window, and does not let a direction move it
+    /// away. Touch hides the highlight and lets focus go.
+    final class Probe: UIView {
+        private var watch: NSObjectProtocol?
+        private static var appliedLogged = false
+        private static var heldLogged = false
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            isUserInteractionEnabled = false
+            backgroundColor = .clear
+            focusEffect = nil
+        }
+        required init?(coder: NSCoder) { nil }
+        deinit { if let watch { NotificationCenter.default.removeObserver(watch) } }
+        private var holding: Bool {
+            PadHighlight.enabled && PadHighlight.shared.shown && window != nil && !GCController.controllers().isEmpty
+        }
+        override var canBecomeFocused: Bool { holding }
+        override func shouldUpdateFocus(in context: UIFocusUpdateContext) -> Bool {
+            if context.previouslyFocusedItem === self, holding { return false }
+            return super.shouldUpdateFocus(in: context)
+        }
+        private func hold() {
+            guard holding, let system = UIFocusSystem.focusSystem(for: self), system.focusedItem !== self else { return }
+            system.requestFocusUpdate(to: self)
+            system.updateFocusIfNeeded()
+            if !Self.heldLogged {
+                Self.heldLogged = true
+                LogStore.shared.log("[pad-highlight] system focus held off the rows while the highlight shows")
+            }
+        }
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if let watch { NotificationCenter.default.removeObserver(watch); self.watch = nil }
+            guard window != nil else { return }
+            watch = NotificationCenter.default.addObserver(forName: UIFocusSystem.didUpdateNotification, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.hold() }
+            }
+            // The list is in the hierarchy once the Form's first layout ran.
+            DispatchQueue.main.async { [weak self] in self?.apply(); self?.hold() }
+        }
+        private func applied(_ count: Int) {
+            guard !Self.appliedLogged else { return }
+            Self.appliedLogged = true
+            LogStore.shared.log("[pad-highlight] a page's list takes no system focus (\(count))")
+        }
+        private func apply() {
+            // Inside a row: the list is an ancestor.
+            var up = superview
+            while let view = up {
+                if let list = view as? UICollectionView {
+                    list.allowsFocus = false; list.selectionFollowsFocus = false
+                    applied(1)
+                    return
+                }
+                up = view.superview
+            }
+            var ancestor = superview
+            for _ in 0..<8 {
+                guard let view = ancestor else { return }
+                let found = Self.lists(in: view, depth: 5)
+                if !found.isEmpty {
+                    for list in found { list.allowsFocus = false; list.selectionFollowsFocus = false }
+                    applied(found.count)
+                    return
+                }
+                ancestor = view.superview
+            }
+        }
+        static func lists(in view: UIView, depth: Int) -> [UICollectionView] {
+            if let list = view as? UICollectionView { return [list] }
+            guard depth > 0 else { return [] }
+            return view.subviews.flatMap { lists(in: $0, depth: depth - 1) }
+        }
+    }
+}
+
+/// A sheet over the tabs (a store game's sheet, a Settings sheet): its own layer. B closes it
+/// and A runs `accept` (its Install or Open), when it has one.
+struct PadSheet: ViewModifier {
+    let accept: (() -> Void)?
+    @Environment(\.dismiss) private var dismiss
+    func body(content: Content) -> some View {
+        content
+            .modifier(ClaimGamepadEvents())
+            .padLayer("sheet", back: { dismiss() }, accept: accept)
+            .onAppear { PadHighlight.shared.sheets += 1 }
+            .onDisappear { PadHighlight.shared.sheets = max(0, PadHighlight.shared.sheets - 1) }
+    }
+}
+
+/// A store's game card for the highlight: A presses it, as a tap does.
+struct PadCardStyle: PrimitiveButtonStyle {
+    let id: String
+    let grid: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        Group {
+            if grid { Button(action: configuration.trigger) { configuration.label }.buttonStyle(LibraryCardButtonStyle()) }
+            else { Button(action: configuration.trigger) { configuration.label }.buttonStyle(.plain) }
+        }
+        .padItem(id, cornerRadius: grid ? 16 : 12, press: configuration.trigger)
+    }
+}
+
+extension View {
+    /// A Form the system's focus must not walk while a controller is connected
+    /// (PadNoSystemFocus): the game's pages.
+    @ViewBuilder func padNoSystemFocus() -> some View {
+        if PadHighlight.enabled, GamepadInput.enabled, !GCController.controllers().isEmpty {
+            background(PadNoSystemFocus().frame(width: 1, height: 1).allowsHitTesting(false))
+        } else { self }
+    }
+
+    /// A sheet over the tabs: B closes it and A runs `accept` (PadSheet).
+    func padSheet(accept: (() -> Void)? = nil) -> some View { modifier(PadSheet(accept: accept)) }
 }

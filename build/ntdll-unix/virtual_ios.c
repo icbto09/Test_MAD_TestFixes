@@ -38303,6 +38303,81 @@ int ios_addr_max_prot( const void *addr, int *prot )
     return maximum;
 }
 
+/* madeira-bcd [guest-data]: what the address of a guest access violation is.
+ *
+ * Brawlhalla (Wave 13, Nov 8) died on "AV WRITE of 705F950FC2" from FEX code,
+ * and the only line about memory was [guest-rip]'s query of the PC -- a FEX
+ * code buffer in the pool, which Wine has no view of, so it always says
+ * "NOT COMMITTED (jumped into nothing)" and points the reader at the wrong
+ * address. The address that matters is the data address. Say what Wine thinks
+ * it is (view, committed or only reserved, protection, guard, write watch) and
+ * what the host has mapped there, and which of the two disagrees.
+ *
+ * Called from the signal path: the host side is a plain mach_vm_region, and
+ * the Wine side is read only when virtual_mutex can be taken without waiting
+ * (it is recursive, so a fault inside Wine on this thread still gets it). */
+void ios_describe_fault_data( const void *addr, int access, char *buf, size_t len )
+{
+    char *hs = NULL, *he = NULL;
+    int hprot = 0, hmax = 0, host, have_view = 0, view_known = 0;
+    BYTE vprot = 0;
+    void *vbase = NULL;
+    size_t vsize = 0;
+    unsigned int vprotect = 0;
+    const char *verdict, *what = access == 1 ? "WRITE" : access == 8 ? "EXEC" : "READ";
+    uintptr_t a = (uintptr_t)addr;
+    const char *where = "";
+
+    host = ios_query_host_region( (char *)addr, &hs, &he, &hprot, &hmax ) &&
+           (char *)addr >= hs && (char *)addr < he;
+    if (!pthread_mutex_trylock( &virtual_mutex ))
+    {
+        struct file_view *view = find_view( addr, 0 );
+        view_known = 1;
+        if (view)
+        {
+            have_view = 1;
+            vbase = view->base;
+            vsize = view->size;
+            vprotect = view->protect;
+            vprot = get_page_vprot( addr );
+        }
+        pthread_mutex_unlock( &virtual_mutex );
+    }
+
+    if (ios_jit_rx_base_global && a - (uintptr_t)ios_jit_rx_base_global < ios_jit_pool_size_global)
+        where = " [in the JIT pool RX span]";
+    else if (ios_jit_rw_base_global && a - (uintptr_t)ios_jit_rw_base_global < ios_jit_pool_size_global)
+        where = " [in the JIT pool RW alias]";
+    else if (ios_fex_arena_base_unix && a >= ios_fex_arena_base_unix && a < ios_fex_arena_end_unix)
+        where = " [in the FEX arena]";
+
+    if (!view_known)
+        verdict = "Wine's view not read (memory lock busy)";
+    else if (!have_view)
+        verdict = host ? "no Wine view but host-mapped (Madeira's or the host's memory, not the program's)"
+                       : "NOTHING THERE (freed or never allocated: a stale or wild pointer)";
+    else if (!(vprot & VPROT_COMMITTED))
+        verdict = "RESERVED, NEVER COMMITTED (a commit failed or was skipped: see [alloc-fail] before)";
+    else if (vprot & VPROT_GUARD)
+        verdict = "a guard page (should have been a guard-page exception)";
+    else if (access == 1 && !(vprot & (VPROT_WRITE | VPROT_WRITECOPY)))
+        verdict = (vprot & VPROT_WRITEWATCH) ? "committed, write-watched" :
+                  "READ-ONLY FOR WINDOWS TOO (the program or a DLL protected it: a real guest fault)";
+    else if (access == 1 && (!host || !(hprot & VM_PROT_WRITE)))
+        verdict = "WINE SAYS WRITABLE, HOST PAGE IS NOT (Madeira mapping/protection bug)";
+    else if (access != 1 && (!host || !(hprot & VM_PROT_READ)))
+        verdict = "WINE SAYS READABLE, HOST PAGE IS NOT (Madeira mapping/protection bug)";
+    else
+        verdict = "allowed on both sides (transient, or a fault Madeira's handler should have taken)";
+
+    /* the verdict first: Get Help's report clips a line at 220 characters */
+    snprintf( buf, len, "%s of %p: %s%s | wine %s%p+%#lx vprot=%#x protect=%#x | host %s%p-%p prot=%d/%d",
+              what, addr, verdict, where, have_view ? "view " : view_known ? "no view " : "? ",
+              vbase, (unsigned long)vsize, (unsigned)vprot, vprotect,
+              host ? "" : "unmapped, next ", hs, he, host ? hprot : 0, host ? hmax : 0 );
+}
+
 /* ml1101b: the JIT pool is ONE opaque block for this purpose.
  *
  * Measured (dsr-log-nearalloc, 29.09): with ml1101 a startup walker that

@@ -59,8 +59,14 @@ require('kSecAttrAccessibleWhenUnlockedThisDeviceOnly' in api and 'kSecAttrSynch
 require('https://api.itch.io' in api and 'api_key' not in api, 'the key goes in the Authorization header, never in an address')
 library = (app / 'Library.swift').read_text()
 require('var itchGameID: Int?' in library, 'library entries record their itch.io game')
-require(library.count('$0.itchGameID == nil') >= 2, 'Other games: no itch.io game (it has its own section)')
-require('ItchGamesSection(search: search' in library and 'ItchSettingsSection()' in library, 'the library and Settings show itch.io')
+# One UI (Nov 10): the store's games are listed on its Stores page (NewLook.swift) and its
+# settings on its Settings page (SettingsPages.swift); Other games is the added() list.
+pages_ui = (app / 'SettingsPages.swift').read_text()
+newlook_ui = (app / 'NewLook.swift').read_text()
+require('entry.itchGameID == nil' in newlook_ui[newlook_ui.index('@MainActor static func added() -> [LibraryEntry] {'):],
+        'Other games: no itch.io game (it has its own section)')
+require('case .itch: ItchGamesSection(search: ""' in newlook_ui and 'case .itch: ItchSettingsSection()' in pages_ui,
+        'the Stores tab and Settings show itch.io')
 require('case .itch: ItchEntrySection(entry: $entry)' in library, 'Game details: the itch.io page')
 require('func upsertItch(' in library and 'func removeItch(' in library, 'installs and uninstalls keep the library in step')
 require('ItchLibrary.shared.installed[game] == nil' in library, 'an uninstalled itch.io game does not start')

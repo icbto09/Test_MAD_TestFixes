@@ -56,19 +56,20 @@ check('infoDictionary?["MadeiraGetHelpKey"]' in view, 'the key is read from Info
 check(not re.search(r'x-madeira-key[^\n]*"[A-Za-z0-9]{20,}"', core + view), 'no key written in the source')
 
 # 3. Game details.
-check('+ (GetHelp.enabled ? ["help"] : [])' in lib, 'the ring reaches Get Help')
-check('case "help": getHelp = true' in lib, 'A on the ring opens Get Help')
-check('detailRow("help", last: true) { GetHelpRow { getHelp = true }' in lib and 'lookRow("gp-help", last: true, press: { getHelp = true })' in lib,
-      'the Get Help row on Game details (details-rebuild row; the new look\'s page too)')
+# One UI (Nov 10): the game's page is Apple's list; Get Help is a row with the controller's highlight.
+check('.padItem("gp-help", cornerRadius: 12, inset: -6) { getHelp = true }' in lib and 'Button { getHelp = true } label: {' in lib,
+      "the Get Help row on the game's page: a tap or A on the controller's highlight opens it")
 check('.getHelpSheet($getHelp, entry: entry) { reloadBCD() }' in lib, 'the page reads the config again after the sheet')
 check('GetHelpUndoSection(windowsPath: entry.windowsPath' in lib, 'Undo Get Help on the Advanced page')
-check('guard !NewLook.enabled, path.isEmpty, !getHelp, !leaving' in lib and 'guard !NewLook.enabled, !getHelp, !leaving, !findCover' in lib
-      and 'guard !getHelp, !leaving, !findCover, !importCover, !remove, !confirmReset, !confirmSteamUninstall' in lib, 'the page leaves the controller to the sheet while it is open')
+check('guard !getHelp, !leaving, !findCover, !importCover, !remove, !confirmReset, !confirmSteamUninstall' in lib, 'the page leaves the controller to the sheet while it is open')
 check('.modifier(GetHelpOffer(play: play))' in lib, 'the library shows the offer (and starts Play Again)')
 # 3b. (get-help-auto) Get Help opens by itself after a launch error, and walks through the answer.
 check('.modifier(GetHelpStartScreen())' in lib, 'the starting screen hosts its own Get Help sheet')
 check('.onChange(of: dockStart.failure)' in view and 'onStartScreen: true)' in view, '"Madeira Dock stopped" opens Get Help by itself')
-check('launchGetHelp(entry)' in lib and lib.count('launchGetHelp(entry)') == 2, 'both starting screens have the Get Help button')
+# One UI (Nov 10): one starting screen; its failure card has Get Help (filled) while the Dock stopped.
+check('NewLookSheetButton(id: "ln-help", title: L("Get Help"), symbol: "lifepreserver", filled: true) {\n'
+      '                        GetHelpCenter.shared.openOnStartScreen(entry, error: dockStart.failure)' in lib,
+      'the starting screen has the Get Help button')
 check('if !getHelpInstead(words, entry: entry) { error = words }' in lib, 'a failed start opens Get Help instead of the alert')
 check('if !getHelpInstead(report, entry: activeEntry) { error = report }' in lib, 'a Windows error opens Get Help instead of the alert')
 check('guard GetHelp.enabled, GetHelp.offers else { return false }' in view, 'env.MADEIRA_GET_HELP_OFFER = 0 keeps the old alerts')

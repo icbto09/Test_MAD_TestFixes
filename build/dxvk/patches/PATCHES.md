@@ -8,6 +8,7 @@ unchanged; the patch only matters on a driver that lacks them.
 | Patch | Summary |
 |---|---|
 | 0001-vulkan-on-metal-optional-features.patch | geometryShader, fillModeNonSolid, shaderCullDistance and VK_EXT_depth_clip_enable become optional (upstream refuses the device: "Device does not support required feature ..."). One `warn: Madeira: no ...` line per missing feature; D3D11 geometry shaders are not bound on a device without them; wireframe draws solid; depth clip is expressed through depthClampEnable in pipelines and pipeline libraries |
+| 0002-singleton-retry-after-failed-construction.patch | `Singleton::acquire` (src/util/util_singleton.h) counts a user only after the object was built. Upstream counts first, so when `DxvkInstance`'s constructor throws (no Vulkan instance) the count stays 1 with a null object: the program's next `CreateDXGIFactory*` gets a null instance and `DxgiFactory`'s constructor reads `m_instance->config()` through it (c0000005, read of 0x28, in an `unordered_map<string,string>` copy). With the patch the next call retries, and a second failure returns E_FAIL like the first. Seen: Backrooms: Escape Together (UE, Wave 13, 2026-11-08), dxvk-dxgi.dll+0x8320 |
 
 Why: DXVK 3.1.1's hard requirements (`src/dxvk/dxvk_device_info.cpp`, the
 `ENABLE_*(..., true)` rows of the feature table, checked by

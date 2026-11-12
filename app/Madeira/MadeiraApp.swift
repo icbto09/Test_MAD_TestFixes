@@ -42,6 +42,8 @@ struct MadeiraApp: App {
                     AchievementWatcher.shared.start()             // unlock banners from Steam's stats files (SteamAchievements.swift)
                     ClaudeHelp.install()                          // the fixes guide beside madeira-log.txt (ClaudeHelp.swift)
                     LogTrail.install()                            // presses, focus, screens, taps, start steps (LogTrail.swift)
+                    CrashReports.start()                          // crashes, freezes and own errors go to the team (CrashReports.swift)
+                    GetHelpUpload.resendLate()                    // (late-zip) Get Help zips Madeira closed before sending (GetHelpView.swift)
                 }
                 // madeira://jit-network/... (the Madeira JIT shortcut returning, JITNetwork.swift),
                 // else a shared game setup (a .madeirasetup file or madeira://setup?d=..., GameSetupShare.swift),
