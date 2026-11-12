@@ -1,0 +1,22 @@
+--- a/src/util/util_singleton.h
++++ b/src/util/util_singleton.h
+@@ -20,9 +20,18 @@
+   Rc<T> acquire(Args... constantArgs) {
+     std::lock_guard lock(m_mutex);
+ 
+-    if (!(m_useCount++))
++    // Madeira: count the user only once the object exists. Upstream
++    // increments first, so when T's constructor throws (DxvkInstance when
++    // no Vulkan instance can be created) the count stays 1 with no object,
++    // and every later acquire() returns null: the next CreateDXGIFactory
++    // then reads m_instance->config() through it (c0000005, read of 0x28).
++    // Now a failed construction leaves the count at 0, the next call tries
++    // again, and a second failure is the same DxvkError the caller already
++    // turns into E_FAIL.
++    if (!m_useCount)
+       m_object = new T(constantArgs...);
+ 
++    m_useCount++;
+     return m_object;
+   }
+ 

@@ -164,19 +164,44 @@ struct ModDocumentPicker: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let types: [UTType] = folder ? [.folder]
             : [.zip, .archive, .data] + ["7z", "rar", "fomod"].compactMap { UTType(filenameExtension: $0) }
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: true)
+        // A folder cannot be opened with asCopy (the picker crashed on Choose a Folder, Test 8):
+        // it is opened in place and copied in the delegate while its access is open.
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: !folder)
         picker.allowsMultipleSelection = false
         picker.delegate = context.coordinator
         return picker
     }
 
     func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
-    func makeCoordinator() -> Coordinator { Coordinator(done) }
+    func makeCoordinator() -> Coordinator { Coordinator(folder: folder, done: done) }
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let folder: Bool
         let done: (URL?) -> Void
-        init(_ done: @escaping (URL?) -> Void) { self.done = done }
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) { done(urls.first) }
+        init(folder: Bool, done: @escaping (URL?) -> Void) { self.folder = folder; self.done = done }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard let url = urls.first else { done(nil); return }
+            guard folder else { done(url); return }
+            // The chosen folder is copied into the app's temp area, then the copy is used.
+            let opened = url.startAccessingSecurityScopedResource()
+            defer { if opened { url.stopAccessingSecurityScopedResource() } }
+            let copy = FileManager.default.temporaryDirectory
+                .appendingPathComponent("mod-folder-\(UUID().uuidString)", isDirectory: true)
+            var failure: NSError?
+            var copied = false
+            NSFileCoordinator().coordinate(readingItemAt: url, options: [], error: &failure) { source in
+                do {
+                    try FileManager.default.createDirectory(at: copy, withIntermediateDirectories: true)
+                    let target = copy.appendingPathComponent(source.lastPathComponent, isDirectory: true)
+                    try FileManager.default.copyItem(at: source, to: target)
+                    copied = true
+                } catch {
+                    LogStore.shared.log("[mods] copying the chosen folder failed: \(error.localizedDescription)", level: .error)
+                }
+            }
+            if let failure { LogStore.shared.log("[mods] reading the chosen folder failed: \(failure.localizedDescription)", level: .error) }
+            done(copied ? copy.appendingPathComponent(url.lastPathComponent, isDirectory: true) : nil)
+        }
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) { done(nil) }
     }
 }

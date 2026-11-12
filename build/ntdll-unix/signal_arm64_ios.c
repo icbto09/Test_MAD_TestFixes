@@ -9528,6 +9528,26 @@ static void ios_log_guest_exception( const char *via, const EXCEPTION_RECORD *re
             rec->ExceptionAddress, (unsigned long long)pc, (unsigned int)rec->NumberParameters,
             rec->NumberParameters > 0 ? (unsigned long long)rec->ExceptionInformation[0] : 0,
             rec->NumberParameters > 1 ? (unsigned long long)rec->ExceptionInformation[1] : 0);
+    /* madeira-bcd [guest-data]: for an access violation, describe the address it
+     * touched (ios_describe_fault_data). Once per distinct fault (raise and
+     * dispatch both come here), the first 8 per session. */
+    if (rec->ExceptionCode == 0xc0000005 && rec->NumberParameters >= 2)
+    {
+        extern void ios_describe_fault_data( const void *addr, int access, char *buf, size_t len );
+        static ULONG_PTR last_addr, last_data;
+        static volatile int data_n;
+        if (((ULONG_PTR)rec->ExceptionAddress != last_addr || rec->ExceptionInformation[1] != last_data) &&
+            __sync_add_and_fetch( &data_n, 1 ) <= 8)
+        {
+            char line[400];
+            last_addr = (ULONG_PTR)rec->ExceptionAddress;
+            last_data = rec->ExceptionInformation[1];
+            ios_describe_fault_data( (const void *)rec->ExceptionInformation[1], (int)rec->ExceptionInformation[0],
+                                     line, sizeof(line) );
+            dprintf(2, "[guest-data] c0000005 tid=%04x %s | pc=%llx\n",
+                    (unsigned int)(ULONG_PTR)NtCurrentTeb()->ClientId.UniqueThread, line, (unsigned long long)pc);
+        }
+    }
     if (rec->ExceptionCode == 0x40010006 && rec->NumberParameters >= 2 &&
         rec->ExceptionInformation[1])   /* DBG_PRINTEXCEPTION_C: [0]=len [1]=char* */
         dprintf(2, "[exc-disp]   OutputDebugStringA: \"%.*s\"\n",
@@ -9743,6 +9763,59 @@ static int ios_storm_end_child_only( thread_t thread, uintptr_t thread_teb, uint
     if (kr != KERN_SUCCESS) kr = thread_suspend( thread );
     __sync_fetch_and_add( &ended, 1 );
     dprintf( 2, "[redeliv] the storming thread is ended (kr=%d)\n", (int)kr );
+    return 1;
+}
+
+/* [syscall-guard] A GUARD page hit inside a system call that guards itself with __TRY.
+ *
+ * The Mach exception thread asks Wine's page machinery about every fault first. For a guard page that is not a stack
+ * guard it clears VPROT_GUARD and answers STATUS_GUARD_PAGE_VIOLATION, and the code below went straight to `dispatch`,
+ * skipping the guest-pc gate that every other fault passes. When the faulting code is a unix-side system call (a memmove
+ * of NtReadVirtualMemory on the process's own memory), that pushed a guest exception frame onto the kernel stack, where
+ * no guest frame is inside the stack limits: "call_seh_handlers invalid frame", "Exception frame is not in stack limits",
+ * NtTerminateProcess(0x1f), exit 31. Seen on The Binding of Isaac: Rebirth (Test 8, Nov 10): five probes of PROT_NONE
+ * pages failed cleanly through [syscall-fault], then the sixth landed on a guard page and ended the game.
+ *
+ * Decline instead (return 0), exactly as the gate does for an access violation at a host pc: the kernel then raises SIGBUS
+ * on the faulting thread, and bus_handler's [syscall-fault] returns to the __EXCEPT block, so the call fails with a status
+ * as it does on Windows. Only when the pc is outside guest code AND that thread's jmp_buf is set (a __TRY is active);
+ * a guard page hit by guest code, or by unix code without a __TRY, is dispatched as before. The jmp_buf is read with
+ * mach_vm_read_overwrite, since this thread must never fault. MADEIRA_GUARD_SYSCALL_FAULT=0 restores the old dispatch. */
+static int ios_mach_guard_in_syscall_try( uint64_t pc, uintptr_t rxb, size_t pool_size, uintptr_t teb_addr,
+                                          NTSTATUS st, uint64_t fault_addr )
+{
+    static int enabled = -1;
+    static int said;
+    struct ntdll_thread_data *td;
+    void *jb = NULL;
+    mach_vm_size_t got = 0;
+
+    if (enabled < 0)
+    {
+        const char *e = getenv( "MADEIRA_GUARD_SYSCALL_FAULT" );
+        enabled = !(e && e[0] == '0');
+    }
+    if (!enabled) return 0;
+    if (st != STATUS_GUARD_PAGE_VIOLATION) return 0;
+    /* the same guest-side test as the gate after the page machinery */
+    if ((rxb && pc >= rxb && pc < rxb + pool_size) ||
+        ios_jit_low_contains( (uintptr_t)pc ) ||
+        pc < 0x100000000ULL ||
+        (pc >= 0x7000000000ULL && pc < 0x7400000000ULL))
+        return 0;
+    if (!teb_addr) return 0;
+    td = (struct ntdll_thread_data *)&((TEB *)teb_addr)->GdiTebBatch;
+    if (mach_vm_read_overwrite( mach_task_self(), (mach_vm_address_t)(uintptr_t)&td->jmp_buf, sizeof(jb),
+                                (mach_vm_address_t)(uintptr_t)&jb, &got ) != KERN_SUCCESS
+        || got != sizeof(jb) || !jb)
+        return 0;
+    if (said < 16)
+    {
+        said++;
+        dprintf( 2, "[syscall-guard] a guard page at 0x%llx was hit inside a system call with a __TRY (pc=0x%llx teb=0x%llx): "
+                    "declined to bus_handler so the call fails instead of the process ending\n",
+                 (unsigned long long)fault_addr, (unsigned long long)pc, (unsigned long long)teb_addr );
+    }
     return 1;
 }
 
@@ -10283,7 +10356,13 @@ static int ios_mach_deliver_guest_exception_inner( thread_t thread, arm_thread_s
                 }
                 return 2;
             }
-            if (st != STATUS_ACCESS_VIOLATION) goto dispatch;
+            if (st != STATUS_ACCESS_VIOLATION)
+            {
+                /* [syscall-guard] a guard page hit by a system call's own __TRY goes to bus_handler, not the guest */
+                if (ios_mach_guard_in_syscall_try( pc, rxb, ios_jit_pool_size_global, (uintptr_t)teb, st, fault_addr ))
+                    return 0;
+                goto dispatch;
+            }
         }
     }
 

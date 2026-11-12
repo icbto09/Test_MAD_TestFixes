@@ -1268,6 +1268,8 @@ struct hlsl_ctx
     bool include_empty_buffers;
     bool warn_implicit_truncation;
     bool double_as_float_alias;
+    /* Madeira: the [hlsl-index] line was written for this shader. */
+    bool madeira_nonuint_index_logged;
 };
 
 static inline bool hlsl_version_ge(const struct hlsl_ctx *ctx, unsigned int major, unsigned int minor)

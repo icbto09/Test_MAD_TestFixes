@@ -9,25 +9,24 @@ import GameController
 import PhotosUI
 import UniformTypeIdentifiers
 
-// The new look (Settings › Appearance › New look, on by default): Apple's structure (a tab
-// bar, large titles, grouped rows) with the Madeira island behind it, and one controller
-// highlight on every screen (PadHighlight.swift).
+// Madeira's own screens, built from Apple's standard parts (reference/apple-design-rulebook.md):
+// Apple's tab bar with a page stack in every tab, large titles, grouped lists for rows, a grid
+// for covers, Apple's button styles and system colors. The one custom part is the controller's
+// highlight (PadHighlight.swift): an iPhone gives a game controller no focus of its own, so
+// Madeira draws one on every screen (Apple rulebook 12.12, 12.31).
 //
 // Tabs: Library (every installed game, last played first), Stores, Downloads (a % badge
 // while something downloads), Settings, and Search. On an iPhone held upright the tab bar
 // floats at the bottom; sideways and on iPad it sits at the top.
-// Off (the switch, or env.MADEIRA_NEW_LOOK = 0): the library as it was before.
 
 enum NewLook {
-    static let key = "madeiraNewLook"
-    /// madeira.cfg env.MADEIRA_NEW_LOOK = 0 keeps the old look whatever the switch says.
-    static var allowed: Bool { MadeiraConfig.flag("MADEIRA_NEW_LOOK") }
-    static var enabled: Bool { allowed && (UserDefaults.standard.object(forKey: key) as? Bool ?? true) }
     /// A game whose page opens to start it at once (X on a cover): LibraryDetail reads and clears it.
     @MainActor static var autoPlay: UUID?
     /// The Library's cover width in points on a phone (a pinch sets any width between; Settings
     /// › Appearance › Cover size picks Small, Medium or Large). Wide screens use it × 1.27.
     static let coverWidthKey = "madeiraNewLookCoverWidth"
+    /// Settings › Appearance › Zoom haptics: a click as a pinch on the covers crosses a size.
+    static let zoomHapticsKey = "madeiraLibraryZoomHaptics"
     /// The shape scale (tests/host/audit-new-look-shapes.py): small badges 10, covers 16, cards 22;
     /// buttons, pills, chips and bars are capsules.
     static let badgeRadius: CGFloat = 8
@@ -47,76 +46,51 @@ enum NewLook {
     }
 }
 
-// MARK: - Colors
+// MARK: - Shared parts
 
-enum NewLookColor {
-    private static func pair(_ dark: UInt32, _ light: UInt32) -> Color {
-        Color(uiColor: UIColor { trait in
-            let v = trait.userInterfaceStyle == .dark ? dark : light
-            return UIColor(red: CGFloat((v >> 16) & 0xFF) / 255, green: CGFloat((v >> 8) & 0xFF) / 255, blue: CGFloat(v & 0xFF) / 255, alpha: 1)
-        })
-    }
-    /// The filled button (Play): white text passes 4.5:1 on both.
-    static let button = pair(0x0A6CFF, 0x0060DF)
-    static let link = pair(0x5AA9FF, 0x0058C0)
-    static let green = pair(0x30D158, 0x15622A)
-    static let orange = pair(0xFF9F0A, 0xA84300)
-    static let red = pair(0xFF6961, 0xC4001A)
-    static let page = pair(0x000000, 0xF2F2F7)
-    static func ring(_ scheme: ColorScheme) -> Color {
-        scheme == .dark ? Color(red: 0.353, green: 0.663, blue: 1) : Color(red: 0, green: 0.345, blue: 0.753)
-    }
-}
-
-/// A card or group of rows: a blurred material with a hairline edge.
+/// A group inside a page that is not a list (the game page's notes): Apple's secondary
+/// grouped background (Apple rulebook 4.18), no material in the content (5.1).
 struct NewLookCard: ViewModifier {
     var radius: CGFloat = 22
     func body(content: Content) -> some View {
-        content
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: radius, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: radius, style: .continuous).strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5))
+        content.background(Color(uiColor: .secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: radius, style: .continuous))
     }
 }
 
-/// The floating navigation (tab bar, Search, Back, the button hints), always a capsule. On iOS 26
-/// Apple's own Liquid Glass (glassEffect, which bends the light and reacts to a touch); before
-/// that a thick material with a hairline and a soft shadow; with Reduce Transparency, solid.
-/// Only the navigation layer is glass: cards and rows stay the plain material (Apple's rule).
+/// The controller's button hints, floating over the page above the tab bar: Apple's Liquid
+/// Glass on iOS 26 (the controls layer, Apple rulebook 5.1), a thick material before that,
+/// solid with Reduce Transparency.
 struct NewLookGlass: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     func body(content: Content) -> some View {
         if reduceTransparency {
             content
                 .background(Color(uiColor: .secondarySystemBackground), in: Capsule())
-                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.16), lineWidth: 0.5))
+                .overlay(Capsule().strokeBorder(Color(uiColor: .separator), lineWidth: 0.5))
         } else if #available(iOS 26.0, *) {
-            content.glassEffect(.regular.interactive(), in: Capsule())
+            content.glassEffect(.regular, in: Capsule())
         } else {
             content
                 .background(.thickMaterial, in: Capsule())
-                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.16), lineWidth: 0.5))
-                .shadow(color: .black.opacity(0.22), radius: 14, y: 6)
+                .overlay(Capsule().strokeBorder(Color(uiColor: .separator), lineWidth: 0.5))
         }
-    }
-}
-
-/// On iOS 26 the tab bar and Search sit in one glass container, so their glass is drawn as
-/// one piece and blends where they meet, as Apple's own tab bar does.
-struct NewLookGlassGroup: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(iOS 26.0, *) { GlassEffectContainer(spacing: 12) { content } } else { content }
     }
 }
 
 extension View {
     func newLookCard(_ radius: CGFloat = 22) -> some View { modifier(NewLookCard(radius: radius)) }
     func newLookGlass() -> some View { modifier(NewLookGlass()) }
+    /// What sits behind a page that is not a list: Apple's system background (Apple rulebook
+    /// 4.17, 4.19). `grouped`: the page holds groups of rows (the grouped set).
+    func newLookPageBackground(grouped: Bool = false) -> some View {
+        background(Color(uiColor: grouped ? .systemGroupedBackground : .systemBackground).ignoresSafeArea())
+    }
 }
 
 // MARK: - Pages
 
-/// One new-look page: its own scroll view on the island (each tab and each pushed page has
-/// its own, so a tab keeps its place and opens where you left it: ux-review-0044 #2).
+/// A page of covers (the Library, a store's page): its own scroll view on Apple's system
+/// background. Each tab and each pushed page has its own, so a tab keeps its place.
 /// `refresh`: pull to refresh, only on a page it refreshes something on. `top`: when it
 /// changes the page scrolls back to the top (tapping the open tab, as on every iPhone app).
 struct NewLookScrollPage<Content: View>: View {
@@ -139,9 +113,6 @@ struct NewLookScrollPage<Content: View>: View {
                     .frame(maxWidth: 1100, alignment: .leading)
                     .frame(maxWidth: .infinity)
                 }
-                .scrollIndicators(.hidden)
-                // Search: dragging the page puts the keyboard away.
-                .scrollDismissesKeyboard(.immediately)
                 .modifier(NewLookRefresh(refresh: refresh))
                 .padScrollFollow(reader)
                 .onChange(of: top) { _, _ in
@@ -151,9 +122,37 @@ struct NewLookScrollPage<Content: View>: View {
                 }
             }
         }
-        .background { NewLookBackground().ignoresSafeArea() }
+        .newLookPageBackground()
     }
     private static var topID: String { "page-top" }
+}
+
+/// A page of rows (Stores, Downloads, Settings, Search): Apple's grouped list (Apple rulebook
+/// 9.32) on the grouped background the list draws itself (4.17). The controller's highlight
+/// scrolls it, and the system's own focus stays off its rows while a controller is connected.
+/// `top`: when it changes the list scrolls back to its first row, `topID`.
+struct NewLookListPage<Content: View>: View {
+    var refresh: (() async -> Void)? = nil
+    var top = 0
+    var topID: String? = nil
+    @ViewBuilder var content: () -> Content
+    var body: some View {
+        ScrollViewReader { reader in
+            List { content() }
+                .listStyle(.insetGrouped)
+                // Search: dragging the list puts the keyboard away.
+                .scrollDismissesKeyboard(.immediately)
+                .modifier(NewLookRefresh(refresh: refresh))
+                .padScrollFollow(reader)
+                .onChange(of: top) { _, _ in
+                    guard let topID else { return }
+                    withAnimation(UIAccessibility.isReduceMotionEnabled ? nil : .default) {
+                        reader.scrollTo(topID, anchor: .top)
+                    }
+                }
+        }
+        .padNoSystemFocus()
+    }
 }
 
 /// Pull to refresh, only where the page has something to refresh.
@@ -164,14 +163,50 @@ private struct NewLookRefresh: ViewModifier {
     }
 }
 
-// MARK: - Background
+/// A row that opens a page: Apple's list row, with its picture, its name, a line under it, a
+/// value and a chevron (Apple rulebook 9.29: a chevron means "go deeper"). The same row the
+/// game's own pages use, so the controller's highlight sits on it the same way.
+struct NewLookLinkRow<Leading: View>: View {
+    let id: String
+    let title: String
+    var note: String = ""
+    var value: String? = nil
+    let action: () -> Void
+    @ViewBuilder var leading: () -> Leading
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                leading()
+                // Colors by name, not by level: inside a list's button, .primary and .secondary
+                // are levels of the button's tint, so the whole row came out blue. A row that
+                // opens a page reads like Settings' own rows: label color, gray details.
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).foregroundStyle(Color.primary)
+                    if !note.isEmpty { Text(note).font(.subheadline).foregroundStyle(Color.secondary) }
+                }
+                Spacer(minLength: 8)
+                if let value { Text(value).foregroundStyle(Color.secondary).lineLimit(1) }
+                Image(systemName: "chevron.forward").font(.footnote.weight(.semibold)).foregroundStyle(Color(uiColor: .tertiaryLabel))
+                    .accessibilityHidden(true)
+            }
+            .contentShape(Rectangle())
+        }
+        .padItem(id, cornerRadius: 12, inset: -6, press: action)
+    }
+}
+extension NewLookLinkRow where Leading == EmptyView {
+    init(id: String, title: String, note: String = "", value: String? = nil, action: @escaping () -> Void) {
+        self.init(id: id, title: title, note: note, value: value, action: action) { EmptyView() }
+    }
+}
+
+// MARK: - Starting screen background
 
 /// The Madeira island (the banner art from the Madeira repository, text taken out), faded at
-/// its cut edges and dimmed so text on it stays readable. Behind every new-look page.
+/// its cut edges and dimmed so text on it stays readable. Behind the game starting screen
+/// only (a game's own loading view may have its own style: Apple rulebook 11.9); every page
+/// uses Apple's system backgrounds (4.19, 7.26).
 struct NewLookBackground: View {
-    @Environment(\.colorScheme) private var scheme
-    /// `startScreen`: the starting screen, always dark.
-    var startScreen = false
     static let image: UIImage? = Bundle.main.url(forResource: "MadeiraIsland", withExtension: "png")
         .flatMap { UIImage(contentsOfFile: $0.path) }
 
@@ -183,26 +218,21 @@ struct NewLookBackground: View {
             let scale: CGFloat = upright && w < 600 ? 1.05 : max(1.3, w / 860)
             let size = CGSize(width: 600 * scale, height: 300 * scale)
             let origin = upright && w < 600 ? CGPoint(x: -150, y: 58) : CGPoint(x: w * (upright ? 0.22 : 0.38), y: -140)
-            let dark = scheme == .dark || startScreen
             ZStack(alignment: .topLeading) {
-                (startScreen ? Color.black : NewLookColor.page)
+                Color.black
                 if let image = Self.image {
                     Image(uiImage: image).resizable().interpolation(.high)
                         .frame(width: size.width, height: size.height)
                         // Dimmed inside the island's own shape only.
-                        .overlay {
-                            (dark ? Color.black.opacity(0.68) : Color(uiColor: .systemGroupedBackground).opacity(0.6))
-                                .mask(Image(uiImage: image).resizable())
-                        }
+                        .overlay { Color.black.opacity(0.68).mask(Image(uiImage: image).resizable()) }
                         // The cut-off edges fade out: the left, the top and the bottom.
                         .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.3)],
                                              startPoint: .leading, endPoint: .trailing))
                         .mask(LinearGradient(stops: [.init(color: .clear, location: 0), .init(color: .black, location: 0.18),
                                                      .init(color: .black, location: 0.62), .init(color: .clear, location: 0.96)],
                                              startPoint: .top, endPoint: .bottom))
-                        .opacity(dark ? 1 : 0.75)
                         .rotationEffect(.degrees(upright && w < 600 ? -8 : -5))
-                        .shadow(color: .black.opacity(dark ? 0.5 : 0.15), radius: 18, y: 18)
+                        .shadow(color: .black.opacity(0.5), radius: 18, y: 18)
                         .offset(x: origin.x, y: origin.y)
                 }
             }
@@ -324,7 +354,7 @@ struct NewLookHints: View {
     @Published private(set) var rows: [Row] = []
     /// "43%" while something downloads, nil otherwise.
     @Published private(set) var badge: String?
-    /// The download whose Remove asks first (NewLookOverlays).
+    /// The download whose Remove asks first (NewLookDownloadsPage's action sheet).
     @Published var confirm: Row?
     private var timer: Timer?
     /// Bytes a second for each running download, smoothed (for "about 5 min left").
@@ -554,20 +584,36 @@ struct NewLookHints: View {
     }
 }
 
-/// The Downloads tab, as in the mock-up: the running download big under "Now", with each of its
+/// The Downloads tab, Apple's grouped list: the running download under "Now" with each of its
 /// steps; then what failed ("Needs attention") and what waits or is paused ("Waiting"). Pause,
-/// Resume (Try again after a failure) and Remove on each.
+/// Resume (Try Again after a failure) and Remove on each (Apple rulebook 9.51 to 9.58).
 struct NewLookDownloadsPage: View {
     @ObservedObject private var downloads = NewLookDownloads.shared
+    var top = 0
     let stores: () -> Void
     var body: some View {
         let now = downloads.rows.first(where: \.active)
         let failed = downloads.rows.filter(\.failed)
         let waiting = downloads.rows.filter { !$0.failed && $0.id != now?.id }
-        VStack(alignment: .leading, spacing: 24) {
-            NewLookTitle(title: L("Downloads"), note: downloads.rows.isEmpty ? "" : String(format: L("%@ in the list"), String(downloads.rows.count)))
+        let first = now ?? failed.first ?? waiting.first
+        NewLookListPage(top: top, topID: first.map { Self.rowID($0) }) {
+            if let now {
+                Section {
+                    nowRow(now)
+                    ForEach(Self.steps(now)) { NewLookStepTile(step: $0, plain: true) }
+                    buttons(now, speed: true)
+                } header: { Text(L("Now")) }
+            }
+            if !failed.isEmpty {
+                Section { ForEach(failed) { row($0) } } header: { Text(L("Needs attention")) }
+            }
+            if !waiting.isEmpty {
+                Section { ForEach(waiting) { row($0) } } header: { Text(L("Waiting")) }
+            }
+        }
+        .overlay {
             if downloads.rows.isEmpty {
-                // Apple's empty screen, with the next step.
+                // Apple's empty screen, with the next step (Apple rulebook 16.16).
                 ContentUnavailableView {
                     Label(L("Nothing downloading"), systemImage: "arrow.down.circle")
                 } description: {
@@ -576,86 +622,87 @@ struct NewLookDownloadsPage: View {
                     NewLookSheetButton(id: "dl-stores", title: L("Go to Stores"), symbol: nil, filled: true, action: stores)
                         .frame(maxWidth: 320)
                 }
-            } else {
-                if let now {
-                    NewLookSection(title: L("Now")) { nowCard(now) }
-                }
-                if !failed.isEmpty {
-                    NewLookSection(title: L("Needs attention")) { list(failed) }
-                }
-                if !waiting.isEmpty {
-                    NewLookSection(title: L("Waiting")) { list(waiting) }
-                }
             }
         }
+        // Remove asks first, in Apple's action sheet (Apple rulebook 9.58, 10.33): a first install
+        // loses what it downloaded so far. Cancel is the safe choice.
+        .confirmationDialog(downloads.confirm.map { String(format: L("Remove %@ from Downloads?"), $0.title) } ?? "",
+                            isPresented: Binding(get: { downloads.confirm != nil }, set: { if !$0 { downloads.confirm = nil } }),
+                            titleVisibility: .visible, presenting: downloads.confirm) { row in
+            Button(L("Remove"), role: .destructive) { downloads.remove(row) }
+            Button(L("Cancel"), role: .cancel) {}
+        } message: { _ in
+            Text("A first install also deletes the files downloaded so far. An update or a repair only stops; the game stays.")
+        }
+        .background { NewLookPopupLayer(shown: downloads.confirm != nil) { downloads.confirm = nil } }
     }
 
-    /// The running download: its store, name, step and time left, Pause and Remove, and its steps.
-    private func nowCard(_ row: NewLookDownloads.Row) -> some View {
+    private static func rowID(_ row: NewLookDownloads.Row) -> String { "dl-row-" + row.id }
+
+    /// The running download: its store, name, step and time left, and how far it is.
+    private func nowRow(_ row: NewLookDownloads.Row) -> some View {
         let steps = Self.steps(row)
         let at = steps.firstIndex { $0.state == .active }
         let line = [at.map { String(format: L("Step %@ of %@"), String($0 + 1), String(steps.count)) }, downloads.detail(row)]
             .compactMap { $0 }.joined(separator: " · ")
-        return VStack(alignment: .leading, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
-                NewLookStoreIcon(store: row.store, size: 48)
+                NewLookStoreIcon(store: row.store, size: 44)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(row.title).font(.headline).lineLimit(2)
-                    if !line.isEmpty { Text(line).font(.subheadline).monospacedDigit().foregroundStyle(.secondary).lineLimit(2) }
+                    Text(row.title).font(.headline)
+                    if !line.isEmpty { Text(line).font(.subheadline).monospacedDigit().foregroundStyle(.secondary) }
                 }
-                Spacer(minLength: 0)
+            }
+            if row.total > 0 { ProgressView(value: row.fraction) }
+        }
+        .accessibilityElement(children: .combine)
+        .id(Self.rowID(row))
+    }
+
+    /// A row under "Needs attention" or "Waiting".
+    private func row(_ row: NewLookDownloads.Row) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(row.title).font(.headline)
+                    Spacer(minLength: 8)
+                    if row.total > 0, !row.failed {
+                        Text("\(Int(row.fraction * 100))%").font(.subheadline).monospacedDigit().foregroundStyle(.secondary)
+                    }
+                }
+                if let detail = downloads.detail(row) {
+                    Text(detail).font(.subheadline).monospacedDigit().foregroundStyle(.secondary)
+                }
+                // What went wrong is said in words beside a warning sign, not by color alone (Apple rulebook 4.2).
+                if row.failed {
+                    Label {
+                        Text(row.store.name + " · " + downloads.shownState(row)).font(.subheadline)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                    }
+                } else {
+                    Text(row.store.name + " · " + downloads.shownState(row)).font(.subheadline).foregroundStyle(.secondary)
+                    ProgressView(value: row.fraction)
+                }
             }
             .accessibilityElement(children: .combine)
-            VStack(spacing: 8) { ForEach(steps) { NewLookStepTile(step: $0) } }
-            buttons(row, speed: true)
+            buttons(row)
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .id(Self.rowID(row))
     }
 
-    /// The rows under "Needs attention" and "Waiting".
-    private func list(_ rows: [NewLookDownloads.Row]) -> some View {
-        ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
-            VStack(alignment: .leading, spacing: 8) {
-                VStack(alignment: .leading, spacing: 6) {
-                    HStack(alignment: .firstTextBaseline) {
-                        Text(row.title).font(.headline).lineLimit(2)
-                        Spacer(minLength: 8)
-                        Text(row.total > 0 && !row.failed ? "\(Int(row.fraction * 100))%" : "")
-                            .font(.subheadline.weight(.semibold)).monospacedDigit().foregroundStyle(.secondary)
-                    }
-                    if let detail = downloads.detail(row) {
-                        Text(detail).font(.subheadline).monospacedDigit().foregroundStyle(.secondary).lineLimit(1)
-                    }
-                    Text(row.store.name + " · " + downloads.shownState(row)).font(.subheadline)
-                        .foregroundStyle(row.failed ? NewLookColor.red : Color.secondary).lineLimit(3)
-                    if !row.failed { ProgressView(value: row.fraction).tint(NewLookColor.link) }
-                }
-                .accessibilityElement(children: .combine)
-                buttons(row)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .overlay(alignment: .bottom) {
-                if index < rows.count - 1 { Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 0.5).padding(.leading, 16) }
-            }
-        }
-    }
-
-    /// Pause or Resume, and Remove. On the Now card (`speed`) the download speed sits at the right end.
+    /// Pause or Resume, and Remove. On the Now rows (`speed`) the download speed sits at the trailing end.
     private func buttons(_ row: NewLookDownloads.Row, speed: Bool = false) -> some View {
         HStack(spacing: 12) {
             Group {
                 if row.failed {
-                    NewLookSmallButton(id: "dl-go-\(row.id)", title: L("Try again"), symbol: "arrow.clockwise", filled: true) { downloads.resume(row) }
+                    NewLookSmallButton(id: "dl-go-\(row.id)", title: L("Try Again"), symbol: "arrow.clockwise") { downloads.resume(row) }
                 } else if downloads.isPaused(row) {
-                    NewLookSmallButton(id: "dl-go-\(row.id)", title: L("Resume"), symbol: "arrow.down.circle.fill", filled: true) { downloads.resume(row) }
+                    NewLookSmallButton(id: "dl-go-\(row.id)", title: L("Resume"), symbol: "arrow.down.circle") { downloads.resume(row) }
                 } else {
                     NewLookSmallButton(id: "dl-go-\(row.id)", title: L("Pause"), symbol: "pause.fill") { downloads.pause(row) }
                 }
-                NewLookSmallButton(id: "dl-remove-\(row.id)", title: L("Remove"), symbol: nil) {
-                    withAnimation(.easeOut(duration: 0.15)) { downloads.confirm = row }
-                }
+                NewLookSmallButton(id: "dl-remove-\(row.id)", title: L("Remove"), symbol: nil) { downloads.confirm = row }
             }
             .layoutPriority(1)
             Spacer(minLength: 0)
@@ -681,31 +728,23 @@ struct NewLookDownloadsPage: View {
     }
 }
 
-/// A small capsule button in a row (Pause, Remove, Change icon).
+/// A button in a row (Pause, Remove): Apple's bordered button, 44 points tall (Apple rulebook
+/// 9.1). In a list row each bordered button takes its own taps.
 struct NewLookSmallButton: View {
     let id: String
     let title: String
     var symbol: String?
-    var filled = false
     let action: () -> Void
     var body: some View {
         Button(action: action) {
-            HStack(spacing: 6) {
-                if let symbol { Image(systemName: symbol) }
-                Text(title).fontWeight(.semibold)
-            }
-            .font(.subheadline)
-            .padding(.horizontal, 16).frame(minHeight: 44)
-            .foregroundStyle(filled ? Color.white : NewLookColor.link)
-            .background { Capsule().fill(filled ? NewLookColor.button : Color.primary.opacity(0.08)) }
-            .contentShape(Capsule())
+            if let symbol { Label(title, systemImage: symbol) } else { Text(title) }
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large)
         .padItem(id, capsule: true, press: action)
     }
 }
 
-/// The Now card's download speed: a larger number with its unit, read out as one item. Not a button.
+/// The Now rows' download speed: a larger number with its unit, read out as one item. Not a button.
 struct NewLookDownloadSpeed: View {
     let number: String
     let unit: String
@@ -717,33 +756,6 @@ struct NewLookDownloadSpeed: View {
         .lineLimit(1).minimumScaleFactor(0.6)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(Text(String(format: L("Download speed %@ %@"), number, unit)))
-    }
-}
-
-/// Remove a download: asks first, and starts on Keep downloading (the safe choice).
-struct NewLookRemoveSheet: View {
-    let row: NewLookDownloads.Row
-    let close: () -> Void
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            Color.black.opacity(0.45).ignoresSafeArea().onTapGesture(perform: close)
-                .accessibilityLabel(L("Keep downloading")).accessibilityAddTraits(.isButton)
-            VStack(alignment: .leading, spacing: 12) {
-                Text(String(format: L("Remove %@ from Downloads?"), row.title)).font(.title2.bold()).lineLimit(3)
-                Text("A first install also deletes the files downloaded so far. An update or a repair only stops; the game stays.")
-                    .font(.subheadline).foregroundStyle(.secondary)
-                NewLookSheetButton(id: "rm-yes", title: L("Remove"), symbol: nil, destructive: true) {
-                    NewLookDownloads.shared.remove(row); close()
-                }
-                NewLookSheetButton(id: "rm-keep", title: L("Keep downloading"), symbol: nil, action: close)
-            }
-            .padding(20)
-            .frame(maxWidth: 520)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: NewLook.sheetRadius, style: .continuous))
-            .padding(12)
-        }
-        .padLayer("remove", start: "rm-keep", back: close)
-        .accessibilityAddTraits(.isModal)
     }
 }
 
@@ -826,8 +838,8 @@ enum NewLookStore: String, CaseIterable, Identifiable {
 /// Documents/madeira-art/store-icon-<store>.png, or the letter on the store's colour.
 @MainActor final class NewLookStoreIcons: ObservableObject {
     static let shared = NewLookStoreIcons()
-    /// The store whose icon is being changed (NewLookOverlays shows its choices).
-    @Published var editing: NewLookStore?
+    /// The store the Photos or Files picker was opened for.
+    var target: NewLookStore?
     @Published var photos = false
     @Published var files = false
     @Published var error: String?
@@ -913,9 +925,12 @@ struct NewLookStoreIcon: View {
     }
 }
 
-/// The Stores tab: every store, whether you are signed in, and how many of its games are here.
+/// The Stores tab, Apple's grouped list: every store, whether you are signed in, and how many
+/// of its games are here; then the Windows desktop.
 struct NewLookStoresPage: View {
+    var top = 0
     let open: (NewLookStore) -> Void
+    let desktop: () -> Void
     @ObservedObject private var steam = SteamOwnedLibrary.shared
     @ObservedObject private var epic = EpicLibrary.shared
     @ObservedObject private var gog = GOGLibrary.shared
@@ -928,49 +943,26 @@ struct NewLookStoresPage: View {
         let accounts = stores.filter { $0.signedIn != nil }
         let signed = accounts.filter { $0.signedIn == true }.count
         let ready = readyGames.all
-        VStack(alignment: .leading, spacing: 16) {
-            NewLookTitle(title: L("Stores")) {
-                HStack(spacing: 8) {
-                    Circle().fill(signed > 0 ? NewLookColor.green : NewLookColor.orange).frame(width: 9, height: 9)
-                    Text(String(format: L("%@ of %@ signed in"), String(signed), String(accounts.count)))
-                        .font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
-                }
-                .padding(.horizontal, 16).frame(minHeight: 36)
-                .background(.regularMaterial, in: Capsule())
-                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
-                .accessibilityElement(children: .combine)
-            }
-            VStack(spacing: 0) {
-                ForEach(Array(stores.enumerated()), id: \.element) { index, store in
+        NewLookListPage(top: top, topID: stores.first.map { "st-" + $0.rawValue }) {
+            Section {
+                ForEach(stores) { store in
                     let installed = ready.filter { $0.id.hasPrefix(store.prefix) }.count
-                    Button { open(store) } label: {
-                        HStack(spacing: 16) {
-                            NewLookStoreIcon(store: store, size: 40)
-                            VStack(alignment: .leading, spacing: 4) {
-                                Text(store.name).font(.headline).foregroundStyle(.primary)
-                                Text(Self.line(store, installed: installed)).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
-                            }
-                            Spacer(minLength: 8)
-                            if let signedIn = store.signedIn {
-                                Text(signedIn ? L("Signed in") : L("Not signed in")).font(.subheadline.weight(.semibold))
-                                    .foregroundStyle(signedIn ? NewLookColor.green : Color.secondary).lineLimit(1)
-                            }
-                            Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
-                        }
-                        .padding(.horizontal, 16).padding(.vertical, 12)
-                        .frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
-                        .contentShape(Rectangle())
+                    NewLookLinkRow(id: "st-" + store.rawValue, title: store.name, note: Self.line(store, installed: installed),
+                                   value: store.signedIn.map { $0 ? L("Signed in") : L("Not signed in") },
+                                   action: { open(store) }) {
+                        NewLookStoreIcon(store: store, size: 40)
                     }
-                    .buttonStyle(.plain)
-                    .overlay(alignment: .bottom) {
-                        if index < stores.count - 1 { Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 0.5).padding(.leading, 16 + 40 + 16) }
-                    }
-                    .accessibilityElement(children: .combine)
-                    .accessibilityAddTraits(.isButton)
-                    .padItem("st-" + store.rawValue, cornerRadius: NewLook.cardRadius, inset: 4) { open(store) }
+                }
+            } footer: {
+                if !accounts.isEmpty { Text(String(format: L("%@ of %@ signed in"), String(signed), String(accounts.count))) }
+            }
+            // The Windows desktop: installers and other Windows programs (the old look's Desktop button).
+            Section {
+                NewLookLinkRow(id: "st-desktop", title: L("Windows Desktop"), note: L("Run installers and other Windows programs."),
+                               action: desktop) {
+                    NewLookBadge(symbol: "desktopcomputer", color: Color(uiColor: .systemGray))
                 }
             }
-            .newLookCard()
         }
     }
 
@@ -1025,8 +1017,9 @@ struct NewLookInstalledHeader: View {
     }
 }
 
-/// A store's page: its icon (the pencil changes it), then the store's own section: sign-in,
-/// what is installed or downloading, and Not installed, each opening the store's own sheet.
+/// A store's page: its icon (a tap changes it) and whether you are signed in, then the store's
+/// own section: sign-in, what is installed or downloading, and Not installed, each opening the
+/// store's own sheet. The store's name is the page's large title (Apple rulebook 8.35).
 struct NewLookStorePage: View {
     let store: NewLookStore
     let width: CGFloat
@@ -1042,35 +1035,42 @@ struct NewLookStorePage: View {
     @ObservedObject private var ea = EALibrary.shared
     @ObservedObject private var library = LibraryModel.shared
     @ObservedObject private var readyGames = NewLookGames.shared
+    @ObservedObject private var icons = NewLookStoreIcons.shared
+    /// Change Icon's choices are up (this page's own, so the same store open in another tab asks nothing).
+    @State private var changeIcon = false
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            HStack(alignment: .center, spacing: 16) {
-                Button { NewLookStoreIcons.shared.editing = store } label: {
-                    NewLookStoreIcon(store: store, size: 64)
+            HStack(alignment: .center, spacing: 12) {
+                Button { changeIcon = true } label: {
+                    NewLookStoreIcon(store: store, size: 60)
                         .overlay(alignment: .bottomTrailing) {
-                            Image(systemName: "pencil").font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
-                                .frame(width: 24, height: 24)
-                                .background(NewLookColor.button, in: Circle())
-                                .overlay(Circle().strokeBorder(Color.white.opacity(0.8), lineWidth: 1.5))
+                            Image(systemName: "pencil.circle.fill").font(.title3)
+                                .symbolRenderingMode(.palette).foregroundStyle(.white, Color.accentColor)
                                 .offset(x: 6, y: 6)
                         }
                         .padding(6)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(L("Change icon"))
-                .padItem("sp-icon", capsule: true) { NewLookStoreIcons.shared.editing = store }
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(store.name).font(.largeTitle.bold()).lineLimit(1).minimumScaleFactor(0.7).accessibilityAddTraits(.isHeader)
-                    if let signedIn = store.signedIn {
-                        Text(signedIn ? L("Signed in") : L("Not signed in")).font(.subheadline.weight(.semibold))
-                            .foregroundStyle(signedIn ? NewLookColor.green : Color.secondary)
-                    }
+                .accessibilityLabel(L("Change Icon"))
+                .padItem("sp-icon", cornerRadius: 22) { changeIcon = true }
+                if let signedIn = store.signedIn {
+                    Text(signedIn ? L("Signed in") : L("Not signed in")).font(.subheadline).foregroundStyle(.secondary)
                 }
             }
             content
         }
         .padLayer("store", back: { dismiss() }, page: true)
         .task { shown() }
+        // Change the icon: Apple's action sheet for the choices about something you just chose
+        // to do (Apple rulebook 10.33), then Apple's Photos or Files picker.
+        .confirmationDialog(String(format: L("%@ icon"), store.name),
+                            isPresented: $changeIcon, titleVisibility: .visible) {
+            Button(L("Choose from Photos")) { icons.target = store; icons.photos = true }
+            Button(L("Choose from Files")) { icons.target = store; icons.files = true }
+            if icons.has(store) { Button(L("Reset Icon"), role: .destructive) { icons.reset(store) } }
+            Button(L("Cancel"), role: .cancel) {}
+        }
+        .background { NewLookPopupLayer(shown: changeIcon) { changeIcon = false } }
     }
 
     @ViewBuilder private var content: some View {
@@ -1092,10 +1092,10 @@ struct NewLookStorePage: View {
         let columns = max(2, Int((width + spacing) / (minimum + spacing)))
         let ids = games.map { "og-" + $0.id }
         return VStack(alignment: .leading, spacing: 16) {
-            NewLookSheetButton(id: "og-add", title: L("Add a game file"), symbol: "plus", filled: true, action: add)
+            NewLookSheetButton(id: "og-add", title: L("Add a Game File"), symbol: "plus", filled: true, action: add)
                 .frame(maxWidth: 360)
             if games.isEmpty {
-                Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap Add a game file and choose its .exe.")
+                Text("Copy a game's folder into Madeira › wine › drive_c with the Files app, then tap Add a Game File and choose its .exe.")
                     .font(.subheadline).foregroundStyle(.secondary)
             } else {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: spacing, alignment: .top), count: columns),
@@ -1115,76 +1115,43 @@ struct NewLookStorePage: View {
     }
 }
 
-/// Change a store's icon: Photos, Files, or back to its letter; Cancel first.
-struct NewLookIconSheet: View {
-    let store: NewLookStore
-    let close: () -> Void
+/// Over every tab: the Photos and Files pickers a store's Change Icon opens, and what went
+/// wrong with a picture (the choices themselves are Apple's action sheet on the store's page).
+struct NewLookOverlays: ViewModifier {
     @ObservedObject private var icons = NewLookStoreIcons.shared
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            Color.black.opacity(0.45).ignoresSafeArea().onTapGesture(perform: close)
-                .accessibilityLabel(L("Cancel")).accessibilityAddTraits(.isButton)
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(spacing: 12) {
-                    NewLookStoreIcon(store: store, size: 44)
-                    Text(String(format: L("%@ icon"), store.name)).font(.title2.bold()).lineLimit(2)
+    @State private var picked: PhotosPickerItem?
+    func body(content: Content) -> some View {
+        content
+            .photosPicker(isPresented: $icons.photos, selection: $picked, matching: .images)
+            .onChange(of: picked) { _, item in
+                guard let item, let store = icons.target else { return }
+                picked = nil
+                Task { @MainActor in
+                    if let data = try? await item.loadTransferable(type: Data.self) { icons.set(store, data: data) }
+                    else { icons.error = L("This image could not be opened.") }
                 }
-                NewLookSheetButton(id: "ic-photos", title: L("Choose from Photos"), symbol: "photo") { close(); icons.photos = true }
-                NewLookSheetButton(id: "ic-files", title: L("Choose from Files"), symbol: "folder") { close(); icons.files = true }
-                if icons.has(store) {
-                    NewLookSheetButton(id: "ic-reset", title: L("Reset icon"), symbol: "arrow.uturn.backward") { icons.reset(store); close() }
-                }
-                NewLookSheetButton(id: "ic-cancel", title: L("Cancel"), symbol: nil, action: close)
             }
-            .padding(20)
-            .frame(maxWidth: 520)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: NewLook.sheetRadius, style: .continuous))
-            .padding(12)
-        }
-        .padLayer("icon", start: "ic-cancel", back: close)
-        .accessibilityAddTraits(.isModal)
+            .fileImporter(isPresented: $icons.files, allowedContentTypes: [.image]) { result in
+                guard let store = icons.target else { return }
+                switch result {
+                case .success(let url): icons.set(store, file: url)
+                case .failure(let error): icons.error = error.localizedDescription
+                }
+            }
+            .alert(L("Store Icon Not Changed"), isPresented: Binding(get: { icons.error != nil }, set: { if !$0 { icons.error = nil } })) {
+                Button(L("OK"), role: .cancel) { icons.error = nil }
+            } message: { Text(icons.error ?? "") }
     }
 }
 
-/// The new look's questions over every tab (Remove a download, Change a store's icon) and
-/// the Photos and Files pickers they open.
-struct NewLookOverlays: View {
-    @ObservedObject private var downloads = NewLookDownloads.shared
-    @ObservedObject private var icons = NewLookStoreIcons.shared
-    @State private var picked: PhotosPickerItem?
-    /// The store the picker was opened for (the sheet closes first).
-    @State private var target: NewLookStore?
+/// While one of Apple's own popups is up, the controller's B closes it (Apple rulebook 12.31:
+/// B cancels). Its buttons are answered by touch: a note in the Test 8 code says the controller
+/// cannot press Apple's popups here (not checked on a device for this rebuild).
+struct NewLookPopupLayer: View {
+    let shown: Bool
+    let close: () -> Void
     var body: some View {
-        ZStack {
-            Color.clear.frame(width: 0, height: 0).allowsHitTesting(false)
-            if let row = downloads.confirm {
-                NewLookRemoveSheet(row: row) { withAnimation(.easeOut(duration: 0.15)) { downloads.confirm = nil } }
-                    .transition(.opacity)
-            }
-            if let store = icons.editing {
-                NewLookIconSheet(store: store) { target = store; withAnimation(.easeOut(duration: 0.15)) { icons.editing = nil } }
-                    .transition(.opacity)
-            }
-        }
-        .photosPicker(isPresented: $icons.photos, selection: $picked, matching: .images)
-        .onChange(of: picked) { _, item in
-            guard let item, let store = target else { return }
-            picked = nil
-            Task { @MainActor in
-                if let data = try? await item.loadTransferable(type: Data.self) { icons.set(store, data: data) }
-                else { icons.error = L("This image could not be opened.") }
-            }
-        }
-        .fileImporter(isPresented: $icons.files, allowedContentTypes: [.image]) { result in
-            guard let store = target else { return }
-            switch result {
-            case .success(let url): icons.set(store, file: url)
-            case .failure(let error): icons.error = error.localizedDescription
-            }
-        }
-        .alert(L("Store icon"), isPresented: Binding(get: { icons.error != nil }, set: { if !$0 { icons.error = nil } })) {
-            Button(L("OK"), role: .cancel) { icons.error = nil }
-        } message: { Text(icons.error ?? "") }
+        if shown { Color.clear.frame(width: 0, height: 0).padLayer("popup", back: close) }
     }
 }
 
@@ -1217,79 +1184,90 @@ extension NewLookTitle where Trailing == EmptyView {
     init(title: String, note: String = "") { self.init(title: title, note: note) { EmptyView() } }
 }
 
-/// Two small pills: JIT (green "JIT" when on; orange "JIT is off" starts Enable JIT, with a
-/// spinner while it starts) and Memory+ (green or orange; it only shows how things are, as the
-/// signed copy of Madeira decides it). Cameron, Test 6: "wherever it says JIT, it should also
-/// have the Memory+ thing", and only JIT is selectable.
-struct NewLookStatusPill: View {
-    let enableJIT: () -> Void
-    @ObservedObject private var jit = LibraryJITState.shared
-    @State private var memory: Bool?
-    /// Enable JIT was pressed and JIT is not on yet: the pill says so and takes no second press
-    /// (Cameron, Test 6: no sign anything happened, three presses started JIT three times).
-    @State private var starting = false
-    var body: some View {
-        let on = jit.enabled
-        let text = on ? L("JIT") : starting ? L("Enabling JIT…") : L("JIT is off")
-        HStack(spacing: 8) {
-            Button { start() } label: {
-                pill(text, color: on ? NewLookColor.green : NewLookColor.orange, busy: starting && !on)
-            }
-            .buttonStyle(.plain)
-            .disabled(on)
-            .accessibilityHint(on ? "" : L("Enable JIT"))
-            // Only while JIT is off: on, it only says how things are (Cameron, Nov 9).
-            .padItem("status", when: !on, capsule: true) { start() }
-            // Not a button and never highlighted: Memory+ cannot be turned on from here.
-            if let memory {
-                pill(L("Memory+"), color: memory ? NewLookColor.green : NewLookColor.orange, busy: false)
-                    .accessibilityLabel(L("Memory+") + ", " + (memory ? L("On") : L("Off")))
-            }
-        }
-        .onChange(of: on) { _, now in if now { starting = false } }
-        // A request that never comes back frees the pill again (a time limit, not a wait for the screen).
-        .task(id: starting) {
-            guard starting else { return }
-            try? await Task.sleep(for: .seconds(15))
-            if !Task.isCancelled { starting = false }
-        }
-        .task { memory = EntitlementStatus.check().increasedMemory }
-    }
+/// Enable JIT from the Library's pill or Settings' row: one start at a time, and a sign that
+/// it is starting (Cameron, Test 6: no sign anything happened, three presses started JIT three times).
+@MainActor final class NewLookJITStart: ObservableObject {
+    static let shared = NewLookJITStart()
+    @Published private(set) var starting = false
+    private var watch: Task<Void, Never>?
 
-    private func pill(_ text: String, color: Color, busy: Bool) -> some View {
-        HStack(spacing: 8) {
-            if busy { ProgressView().controlSize(.mini) } else { Circle().fill(color).frame(width: 8, height: 8) }
-            Text(text).font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
-        }
-        .padding(.horizontal, 12).frame(minHeight: 32)
-        .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.12), lineWidth: 0.5))
-    }
-
-    private func start() {
-        guard !jit.enabled, !starting else { return }
+    func start(_ enableJIT: () -> Void) {
+        guard !LibraryJITState.shared.enabled, !starting else { return }
         starting = true
         LogStore.shared.log("[new-look] status pill: Enable JIT")
         enableJIT()
-        // Look at JIT's state again soon after, not at the next 2 s poll.
-        Task { @MainActor in
-            for _ in 0..<12 {
+        watch?.cancel()
+        watch = Task { @MainActor [weak self] in
+            // Look at JIT's state again soon after, not at the next 2 s poll. A request that
+            // never comes back frees the button again after 15 s (a time limit, not a wait for the screen).
+            for step in 0..<30 {
                 try? await Task.sleep(for: .milliseconds(500))
-                LibraryJITState.shared.refresh()
-                if LibraryJITState.shared.enabled { return }
+                if Task.isCancelled { return }
+                if step < 12 { LibraryJITState.shared.refresh() }
+                if LibraryJITState.shared.enabled { break }
             }
+            self?.starting = false
         }
     }
 }
 
+/// Two small pills: JIT (a green dot and "JIT" when on; off, the pill is the Enable JIT button,
+/// named for what it does (Apple rulebook 16.18), with a spinner while it starts) and Memory+ (it only shows how things are, as the signed
+/// copy of Madeira decides it). Each says its state in words, not by its dot's color alone
+/// (Apple rulebook 4.2). Cameron, Test 6: "wherever it says JIT, it should also have the
+/// Memory+ thing", and only JIT is selectable.
+struct NewLookStatusPill: View {
+    let enableJIT: () -> Void
+    @ObservedObject private var jit = LibraryJITState.shared
+    @ObservedObject private var starter = NewLookJITStart.shared
+    @State private var memory: Bool?
+    var body: some View {
+        let on = jit.enabled
+        let starting = starter.starting && !on
+        HStack(spacing: 8) {
+            if on {
+                pill(L("JIT"), symbol: "checkmark.circle.fill", color: .green, busy: false)
+                    .accessibilityLabel(L("JIT") + ", " + L("On"))
+            } else {
+                Button { starter.start(enableJIT) } label: {
+                    pill(starting ? L("Enabling JIT…") : L("Enable JIT"), symbol: "bolt.circle.fill", color: .orange, busy: starting)
+                        // The pill is 32 points tall; its tap area is 44 (Apple rulebook 9.1).
+                        .frame(minHeight: 44).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(starting)
+                .accessibilityValue(L("Off"))
+                .padItem("status", capsule: true) { starter.start(enableJIT) }
+            }
+            // Not a button and never highlighted: Memory+ cannot be turned on from here.
+            if let memory {
+                pill(L("Memory+"), symbol: memory ? "checkmark.circle.fill" : "minus.circle.fill", color: memory ? .green : .orange, busy: false)
+                    .accessibilityLabel(L("Memory+") + ", " + (memory ? L("On") : L("Off")))
+            }
+        }
+        .task { memory = EntitlementStatus.check().increasedMemory }
+    }
+
+    /// On and off differ by the symbol's shape as well as its color (Apple rulebook 4.2: never by color alone).
+    private func pill(_ text: String, symbol: String, color: Color, busy: Bool) -> some View {
+        HStack(spacing: 6) {
+            if busy { ProgressView().controlSize(.mini) }
+            else { Image(systemName: symbol).font(.footnote.weight(.semibold)).foregroundStyle(color).accessibilityHidden(true) }
+            Text(text).font(.subheadline.weight(.semibold)).lineLimit(1).minimumScaleFactor(0.8)
+        }
+        .padding(.horizontal, 12).frame(minHeight: 32)
+        .background(Color(uiColor: .tertiarySystemFill), in: Capsule())
+    }
+}
+
 /// The Library tab: every installed game from every store and the games you added, last
-/// played first, with a chip per store.
+/// played first, in a grid of covers (Apple rulebook 9.33), with a pop-up button that shows one
+/// store's games. Add a Game is the "+" in the bar above (LibraryView.lookStack).
 struct NewLookLibraryPage: View {
     let width: CGFloat
     let enableJIT: () -> Void
     let open: (LibraryEntry) -> Void
     let play: (LibraryEntry) -> Void
-    let options: (LibraryEntry) -> Void
     let add: () -> Void
     let stores: () -> Void
     /// The ready games, worked out once per change (NewLookGames): a download's progress in any
@@ -1298,12 +1276,12 @@ struct NewLookLibraryPage: View {
     @AppStorage("madeiraNewLookStore") private var store = ""
     /// Cover width (a pinch on the covers, or Settings › Appearance › Cover size).
     @AppStorage(NewLook.coverWidthKey) private var coverWidth: Double = 104
-    @AppStorage(GridZoomHapticPlayer.key) private var zoomHaptics = true
+    @AppStorage(NewLook.zoomHapticsKey) private var zoomHaptics = true
     /// The pinch in progress: the grid follows the fingers live.
     @State private var pinch: CGFloat?
     /// When a pinch ended: lifting the fingers must not open the cover under them.
     @State private var pinchEnded = Date.distantPast
-    /// "Loading your games…" has shown for a while: Try again shows under it.
+    /// "Loading your games…" has shown for a while: Try Again shows under it.
     @State private var slowLoad = false
     @Environment(\.scenePhase) private var scenePhase
 
@@ -1331,7 +1309,7 @@ struct NewLookLibraryPage: View {
                     if slowLoad {
                         Text("Steam's game list is taking a while.").font(.subheadline).foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
-                        NewLookSheetButton(id: "lib-retry", title: L("Try again"), symbol: "arrow.clockwise") {
+                        NewLookSheetButton(id: "lib-retry", title: L("Try Again"), symbol: "arrow.clockwise") {
                             slowLoad = false
                             LogStore.shared.log("[new-look] library: loading again after a slow read")
                             Self.load()
@@ -1347,42 +1325,32 @@ struct NewLookLibraryPage: View {
                     if !Task.isCancelled { slowLoad = true }
                 }
             } else if all.isEmpty {
-                // Apple's empty screen, with the next steps.
+                // Apple's empty screen, with the next steps (Apple rulebook 16.16).
                 ContentUnavailableView {
                     Label(L("Nothing installed yet"), systemImage: "square.grid.2x2")
                 } description: {
                     Text("Sign in to a store and install a game, or add a game you copied in.")
                 } actions: {
-                    Button(action: stores) {
-                        Text("Go to Stores").font(.headline).padding(.horizontal, 24).frame(maxWidth: 320, minHeight: 50)
-                            .background(NewLookColor.button, in: Capsule()).foregroundStyle(.white)
-                    }
-                    .buttonStyle(.plain)
-                    .padItem("first-stores", capsule: true, press: stores)
-                    addButton
+                    NewLookSheetButton(id: "first-stores", title: L("Go to Stores"), symbol: nil, filled: true, action: stores)
+                        .frame(maxWidth: 320)
+                    NewLookSheetButton(id: "add-game", title: L("Add a Game"), symbol: "plus", action: add)
+                        .frame(maxWidth: 320)
                 }
                 .padding(.vertical, 12)
             } else {
                 // The game you played last, big, with Play (Apple Arcade's look; Cameron, Nov 9: banner on
-                // top, then the grid). Only under All: a store's chip shows just its grid.
-                if picked.isEmpty, let last = all.first, last.entry.lastPlayed != nil {
-                    NewLookBanner(game: last, wide: width >= 600, play: { play(last.entry) }, open: { open(last.entry) })
+                // top, then the grid). Only under All: one store's games show just the grid. The top
+                // card's game is not in the grid below it (Cameron, Nov 11: it showed twice).
+                let banner = picked.isEmpty ? all.first.flatMap { $0.played != nil ? $0 : nil } : nil
+                if let banner {
+                    NewLookBanner(game: banner, wide: width >= 600, play: { play(banner.entry) }, open: { open(banner.entry) })
                 }
-                if storeNames.count > 1 {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 8) {
-                            chip("", L("All"), on: picked.isEmpty)
-                            ForEach(storeNames, id: \.self) { name in chip(name, name, on: picked == name) }
-                        }
-                        .padding(.vertical, 6).padding(.horizontal, 2)
-                    }
-                }
-                grid(games)
-                addButton.padding(.top, 8)
+                if storeNames.count > 1 { storePicker(storeNames, picked: picked) }
+                grid(banner.map { top in games.filter { $0.id != top.id } } ?? games)
             }
         }
         // The Library reads every store's installed games when it opens, and again after a game
-        // or coming back to Madeira (the old store sections did this; nothing else does in the new look).
+        // or coming back to Madeira.
         .onAppear { Self.load() }
         .onChange(of: scenePhase) { _, phase in if phase == .active { Self.load() } }
     }
@@ -1396,31 +1364,19 @@ struct NewLookLibraryPage: View {
         if EALibrary.enabled { EALibrary.shared.start(); EALibrary.shared.reconcileSession() }
     }
 
-    private func chip(_ value: String, _ title: String, on: Bool) -> some View {
-        Button { store = value } label: {
-            Text(title).font(.subheadline.weight(.semibold)).lineLimit(1)
-                .padding(.horizontal, 16).frame(minHeight: 44)
-                .foregroundStyle(on ? Color(uiColor: .systemBackground) : Color.primary)
-                .background {
-                    if on { Capsule().fill(Color.primary) } else { Capsule().fill(.regularMaterial) }
-                }
-                .overlay(Capsule().strokeBorder(Color.primary.opacity(on ? 0 : 0.14), lineWidth: 0.5))
+    /// Which store's games show: Apple's pop-up button (Apple rulebook: one of a few options
+    /// that are not commands), on the page it filters (11.24). A on it steps to the next store.
+    private func storePicker(_ names: [String], picked: String) -> some View {
+        Picker(L("Store"), selection: Binding(get: { picked }, set: { store = $0 })) {
+            Text(L("All Stores")).tag("")
+            ForEach(names, id: \.self) { Text($0).tag($0) }
         }
-        .buttonStyle(.plain)
-        .accessibilityAddTraits(on ? .isSelected : [])
-        .padItem("chip-\(value.isEmpty ? "all" : value)", capsule: true) { store = value }
-    }
-
-    private var addButton: some View {
-        Button(action: add) {
-            Label("Add a game", systemImage: "plus").font(.subheadline.weight(.semibold))
-                .padding(.horizontal, 16).frame(minHeight: 44)
-                .foregroundStyle(NewLookColor.link)
-                .background(.regularMaterial, in: Capsule())
-                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.14), lineWidth: 0.5))
+        .pickerStyle(.menu)
+        .frame(minHeight: 44)
+        .padItem("lib-store", capsule: true) {
+            let all = [""] + names
+            store = all[((all.firstIndex(of: picked) ?? 0) + 1) % all.count]
         }
-        .buttonStyle(.plain)
-        .padItem("add-game", capsule: true, press: add)
     }
 
     private func grid(_ games: [LibraryReadyGame]) -> some View {
@@ -1435,12 +1391,14 @@ struct NewLookLibraryPage: View {
             ForEach(games, id: \.padID) { game in
                 Button { if pinch == nil, Date().timeIntervalSince(pinchEnded) > 0.4 { open(game.entry) } } label: { NewLookCover(game: game) }
                     .buttonStyle(LibraryCardButtonStyle())
+                    // Touch and hold: the same two things a tap and the game's page offer (Apple rulebook 9.19).
                     .contextMenu {
                         Button { play(game.entry) } label: { Label("Play", systemImage: "play.fill") }
-                        Button { open(game.entry) } label: { Label("Game page", systemImage: "info.circle") }
+                        Button { open(game.entry) } label: { Label("Game Page", systemImage: "info.circle") }
                     }
+                    // A opens the game's page, X plays, Menu opens the page too (its settings: Apple rulebook 12.31).
                     .padItem("g-" + game.id, cornerRadius: 16, grid: "library",
-                             play: { play(game.entry) }, menu: { options(game.entry) }) { open(game.entry) }
+                             play: { play(game.entry) }, menu: { open(game.entry) }) { open(game.entry) }
             }
         }
         .onAppear { PadHighlight.shared.setGrid("library", ids: ids, columns: columns) }
@@ -1449,7 +1407,8 @@ struct NewLookLibraryPage: View {
         .onDisappear { PadHighlight.shared.removeGrid("library") }
         // Pinch: the covers grow or shrink with the fingers, a column at a time, with a click as
         // each one goes (Cameron, Nov 9: steps, too far to pinch, and a cover opened every time).
-        .animation(.spring(response: 0.3, dampingFraction: 0.86), value: columns)
+        // Settings › Appearance › Cover size does the same without a gesture (Apple rulebook 13.2).
+        .animation(UIAccessibility.isReduceMotionEnabled ? nil : .spring(response: 0.3, dampingFraction: 0.86), value: columns)
         .sensoryFeedback(.selection, trigger: columns) { _, _ in pinch != nil && zoomHaptics }
         .simultaneousGesture(MagnifyGesture(minimumScaleDelta: 0.02)
             .onChanged { value in pinch = value.magnification }
@@ -1463,10 +1422,10 @@ struct NewLookLibraryPage: View {
     }
 }
 
-/// A cover, the game's name, and its store and when it was played.
 /// The Library's banner: the last-played game's wide art edge to edge in a card, its name and when
-/// it was played over a dark fade at the bottom, and Play and Game page on Apple's glass. A game
-/// without wide art (not from Steam) shows its cover blurred behind and sharp on the left.
+/// it was played over a dark fade at the bottom (text over art has its own background: Apple
+/// rulebook 9.68), and Play and Game Page as Apple's buttons over it. A game without wide art
+/// (not from Steam) shows its cover blurred behind and sharp on the left.
 struct NewLookBanner: View {
     let game: LibraryReadyGame
     let wide: Bool
@@ -1498,23 +1457,14 @@ struct NewLookBanner: View {
                     .accessibilityElement(children: .combine)
                     HStack(spacing: 12) {
                         Button(action: play) {
-                            Label("Play", systemImage: "play.fill").font(.body.weight(.semibold))
-                                .padding(.horizontal, 24).frame(minHeight: 44)
-                                .foregroundStyle(.white)
-                                .contentShape(Capsule())
+                            Label("Play", systemImage: "play.fill").fontWeight(.semibold).padding(.horizontal, 8)
                         }
-                        .modifier(LookPlayStyle(leaving: false))
+                        .modifier(LookPlayStyle(overArt: true))
                         .padItem("banner-play", capsule: true, press: play)
-                        Button(action: open) {
-                            Text("Game page").font(.body.weight(.semibold))
-                                .padding(.horizontal, 20).frame(minHeight: 44)
-                                .foregroundStyle(.white)
-                                .contentShape(Capsule())
-                        }
-                        .buttonStyle(.plain)
-                        .newLookGlass()
-                        .environment(\.colorScheme, .dark)
-                        .padItem("banner-open", capsule: true, press: open)
+                        Button(action: open) { Text("Game Page").fontWeight(.semibold) }
+                            .modifier(LookArtButtonStyle())
+                            .environment(\.colorScheme, .dark)
+                            .padItem("banner-open", capsule: true, press: open)
                     }
                 }
                 Spacer(minLength: 0)
@@ -1532,6 +1482,7 @@ struct NewLookBanner: View {
     }
 }
 
+/// A cover, the game's name, and its store and when it was played.
 struct NewLookCover: View {
     let game: LibraryReadyGame
     @Environment(\.libraryCardPressed) private var pressed
@@ -1552,61 +1503,56 @@ struct NewLookCover: View {
     }
 }
 
-/// Menu on a cover: Play, the game's page, or Cancel (the safe choice, highlighted first).
-struct NewLookOptionsSheet: View {
-    let entry: LibraryEntry
-    let play: () -> Void
-    let open: () -> Void
-    let close: () -> Void
-    var body: some View {
-        ZStack(alignment: .bottom) {
-            Color.black.opacity(0.45).ignoresSafeArea().onTapGesture(perform: close)
-                .accessibilityLabel(L("Cancel")).accessibilityAddTraits(.isButton)
-            VStack(alignment: .leading, spacing: 12) {
-                Text(entry.title).font(.title2.bold()).lineLimit(2)
-                NewLookSheetButton(id: "op-play", title: L("Play"), symbol: "play.fill", filled: true, action: play)
-                NewLookSheetButton(id: "op-page", title: L("Game page"), symbol: "info.circle", action: open)
-                NewLookSheetButton(id: "op-cancel", title: L("Cancel"), symbol: nil, action: close)
-            }
-            .padding(20)
-            .frame(maxWidth: 520)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: NewLook.sheetRadius, style: .continuous))
-            .padding(12)
-        }
-        .padLayer("options", start: "op-cancel", back: close)
-        .accessibilityAddTraits(.isModal)
-    }
-}
-
-/// A full-width sheet button: filled (blue) for the main choice, soft otherwise.
+/// A full-width button: Apple's bordered button, the prominent one for the screen's main
+/// choice (Apple rulebook 9.3: one or two prominent buttons a screen).
 struct NewLookSheetButton: View {
     let id: String
     let title: String
     var symbol: String?
     var filled = false
-    var destructive = false
     let action: () -> Void
     var body: some View {
-        Button(action: action) {
-            HStack(spacing: 8) {
-                if let symbol { Image(systemName: symbol) }
-                Text(title).fontWeight(.semibold)
-            }
-            .font(.body)
-            // Room around the words: inside Apple's empty screen the button is only as wide as
-            // its label (Cameron, Test 5: "the text is right up next to the blue").
-            .padding(.horizontal, 24)
-            .frame(maxWidth: .infinity, minHeight: 50)
-            .foregroundStyle(filled || destructive ? Color.white : NewLookColor.link)
-            .background {
-                if filled { Capsule().fill(NewLookColor.button) }
-                else if destructive { Capsule().fill(NewLookColor.red) }
-                else { Capsule().fill(Color.primary.opacity(0.08)) }
-            }
-            .contentShape(Capsule())
+        Group {
+            if filled { button.buttonStyle(.borderedProminent) } else { button.buttonStyle(.bordered) }
         }
-        .buttonStyle(.plain)
+        .buttonBorderShape(.capsule).controlSize(.large)
         .padItem(id, capsule: true, press: action)
+    }
+    private var button: some View {
+        Button(action: action) {
+            Group {
+                if let symbol { Label(title, systemImage: symbol) } else { Text(title) }
+            }
+            .fontWeight(.semibold).frame(maxWidth: .infinity)
+        }
+    }
+}
+
+/// Play's look: Apple's prominent button, a capsule. Over cover art (the Library's banner) on
+/// iOS 26 it is Apple's prominent glass (controls over rich content: Apple rulebook 5.5); on a
+/// page it is the filled button, because glass stays out of the content (5.1).
+struct LookPlayStyle: ViewModifier {
+    var overArt = false
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *), overArt, !reduceTransparency {
+            content.buttonStyle(.glassProminent).buttonBorderShape(.capsule).controlSize(.large)
+        } else {
+            content.buttonStyle(.borderedProminent).buttonBorderShape(.capsule).controlSize(.large)
+        }
+    }
+}
+
+/// A second button over cover art (the banner's Game Page): Apple's glass button on iOS 26,
+/// the bordered button before that and with Reduce Transparency.
+struct LookArtButtonStyle: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    func body(content: Content) -> some View {
+        if #available(iOS 26.0, *), !reduceTransparency {
+            content.buttonStyle(.glass).buttonBorderShape(.capsule).controlSize(.large)
+        } else {
+            content.buttonStyle(.bordered).buttonBorderShape(.capsule).controlSize(.large).tint(.white)
+        }
     }
 }
 
@@ -1688,10 +1634,11 @@ struct NewLookSheetButton: View {
     }
 }
 
-/// The Search tab: your installed games, the stores' games you have not installed, the
-/// stores, and the Settings pages.
+/// The Search tab, Apple's grouped list: your installed games, the stores' games you have not
+/// installed, the stores, and the Settings pages (one place to search everything: Apple rulebook 8.36).
 struct NewLookSearchPage: View {
     @Binding var text: String
+    var top = 0
     let open: (LibraryEntry) -> Void
     let store: (NewLookStore) -> Void
     let storeGame: (NewLookSearch.StoreGame) -> Void
@@ -1701,73 +1648,123 @@ struct NewLookSearchPage: View {
     @ObservedObject private var ready = NewLookGames.shared
     var body: some View {
         let query = text.trimmingCharacters(in: .whitespaces)
-        let games = query.isEmpty ? [] : ready.matching(query)
+        // Before anything is typed: the games played last, as suggestions (Apple rulebook 8.39).
+        let games = query.isEmpty ? Array(ready.all.prefix(6)) : ready.matching(query)
         let others = NewLookSearch.storeGames(query)
         let stores = NewLookSearch.stores(query)
         let pages = NewLookSearch.settings(query)
-        VStack(alignment: .leading, spacing: 16) {
-            // The field is Apple's (.searchable on this tab's page, LibraryView.lookStack). The
-            // controller cannot reach the system's field, so while the highlight shows, a button
-            // puts the keyboard up in it.
-            if text.isEmpty { NewLookTypeButton(field: $field) }
-            if !query.isEmpty {
-                if games.isEmpty && others.isEmpty && stores.isEmpty && pages.isEmpty {
-                    ContentUnavailableView.search(text: query)
-                }
-                if !games.isEmpty {
-                    NewLookSection(title: L("Installed")) {
-                        ForEach(Array(games.enumerated()), id: \.element.id) { index, game in
-                            NewLookSearchRow(id: "sr-" + game.id, last: index == games.count - 1, title: game.entry.title, note: game.note,
-                                             action: { open(game.entry) }) {
-                                LibraryArtwork(entry: game.entry).frame(width: 46, height: 69)
-                                    .clipShape(RoundedRectangle(cornerRadius: NewLook.badgeRadius, style: .continuous))
-                            }
+        let steamDown = !query.isEmpty && NewLookSearchSteamNotice.shows
+        let nothing = games.isEmpty && others.isEmpty && stores.isEmpty && pages.isEmpty && !steamDown
+        NewLookListPage(top: top, topID: games.first.map { "sr-" + $0.id }) {
+            if text.isEmpty { NewLookTypeRow(field: $field) }
+            if steamDown { NewLookSearchSteamNotice() }
+            if !games.isEmpty {
+                Section {
+                    ForEach(games) { game in
+                        NewLookLinkRow(id: "sr-" + game.id, title: game.entry.title, note: game.note, action: { open(game.entry) }) {
+                            LibraryArtwork(entry: game.entry).frame(width: 46, height: 69)
+                                .clipShape(RoundedRectangle(cornerRadius: NewLook.badgeRadius, style: .continuous))
                         }
                     }
-                }
-                if !others.isEmpty {
-                    NewLookSection(title: L("In your stores")) {
-                        ForEach(Array(others.enumerated()), id: \.element.id) { index, game in
-                            NewLookSearchRow(id: "so-" + game.id, last: index == others.count - 1, title: game.title,
-                                             note: game.store.name + " · " + L("Not installed"), action: { storeGame(game) }) {
-                                // The game's own picture, as an installed game's row shows its cover
-                                // (Cameron, Test 6: these showed the store's icon).
-                                NewLookStoreGameArt(game: game).frame(width: 46, height: 69)
-                                    .clipShape(RoundedRectangle(cornerRadius: NewLook.badgeRadius, style: .continuous))
-                            }
+                } header: { Text(L("Installed")) }
+            }
+            if !others.isEmpty {
+                Section {
+                    ForEach(others) { game in
+                        NewLookLinkRow(id: "so-" + game.id, title: game.title, note: game.store.name + " · " + L("Not installed"),
+                                       action: { storeGame(game) }) {
+                            // The game's own picture, as an installed game's row shows its cover
+                            // (Cameron, Test 6: these showed the store's icon).
+                            NewLookStoreGameArt(game: game).frame(width: 46, height: 69)
+                                .clipShape(RoundedRectangle(cornerRadius: NewLook.badgeRadius, style: .continuous))
                         }
                     }
-                }
-                if !stores.isEmpty {
-                    NewLookSection(title: L("Stores")) {
-                        ForEach(Array(stores.enumerated()), id: \.element) { index, item in
-                            NewLookSearchRow(id: "ss-" + item.rawValue, last: index == stores.count - 1, title: item.name,
-                                             note: item.signedIn.map { $0 ? L("Signed in") : L("Not signed in") } ?? "",
-                                             action: { store(item) }) {
-                                NewLookStoreIcon(store: item, size: 40)
-                            }
+                } header: { Text(L("In your stores")) }
+            }
+            if !stores.isEmpty {
+                Section {
+                    ForEach(stores) { item in
+                        NewLookLinkRow(id: "ss-" + item.rawValue, title: item.name,
+                                       note: item.signedIn.map { $0 ? L("Signed in") : L("Not signed in") } ?? "",
+                                       action: { store(item) }) {
+                            NewLookStoreIcon(store: item, size: 40)
                         }
                     }
-                }
-                if !pages.isEmpty {
-                    NewLookSection(title: L("Settings")) {
-                        ForEach(Array(pages.enumerated()), id: \.element) { index, page in
-                            NewLookSearchRow(id: "sp-" + page.key, last: index == pages.count - 1, title: L(page.title), note: page.blurb,
-                                             action: { setting(page) }) {
-                                NewLookBadge(symbol: page.symbol, color: page.color)
-                            }
+                } header: { Text(L("Stores")) }
+            }
+            if !pages.isEmpty {
+                Section {
+                    ForEach(pages, id: \.self) { page in
+                        NewLookLinkRow(id: "sp-" + page.key, title: L(page.title), note: page.blurb, action: { setting(page) }) {
+                            NewLookBadge(symbol: page.symbol, color: page.color)
                         }
                     }
-                }
+                } header: { Text(L("Settings")) }
             }
         }
-        // A tap anywhere but the field or a result puts the keyboard away (Cameron, Nov 9).
-        // (Behind everything, so the field and the results keep their own taps.)
-        .frame(maxWidth: .infinity, minHeight: 500, alignment: .topLeading)
-        .background(Color.clear.contentShape(Rectangle()).onTapGesture { field = false })
+        // Apple's own "no results" screen.
+        .overlay { if !query.isEmpty, nothing { ContentUnavailableView.search(text: query) } }
         .modifier(NewLookSearchFocus(field: $field))
-        .onAppear { if text.isEmpty, !PadHighlight.shared.shown { field = true } }
+        .onAppear {
+            // The keyboard comes up at once on an iPhone (a find-fast search tab: Apple rulebook
+            // 8.41); on an iPad only with a keyboard attached, so the on-screen one does not
+            // cover the page unasked (8.46).
+            let waits = UIDevice.current.userInterfaceIdiom == .pad && GCKeyboard.coalesced == nil
+            if text.isEmpty, !PadHighlight.shared.shown, !waits { field = true }
+        }
         .onDisappear { field = false }
+    }
+}
+
+/// Search, when Steam could not be asked for the account's games: says so in place, quietly
+/// (not an alert: Apple rulebook 10.21, 16.17), says what the results are based on and how to
+/// fix it (16.25), with Try Again (16.18). Without it, a Steam game you own but have not
+/// installed just does not show, which reads as "you don't own it" (Cameron, Nov 11 2026; the
+/// idea is from Madeira's own PR 594, written here from scratch).
+struct NewLookSearchSteamNotice: View {
+    @ObservedObject private var steam = SteamOwnedLibrary.shared
+    /// Steam is on, signed in, and its last request for the account's games failed.
+    @MainActor static var shows: Bool {
+        NewLookStore.steam.enabled && SteamOwnedLibrary.enabled && SteamOwnedLibrary.shared.signedIn
+            && SteamOwnedLibrary.shared.libraryUnreachable != nil
+    }
+    var body: some View {
+        Section {
+            Label {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(L("Steam Can't Be Reached")).foregroundStyle(Color.primary)
+                    Text(detail).font(.subheadline).foregroundStyle(Color.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } icon: {
+                Image(systemName: "wifi.exclamationmark").foregroundStyle(.orange)
+            }
+            .accessibilityElement(children: .combine)
+            Button {
+                retry()
+            } label: {
+                if steam.refreshing {
+                    HStack(spacing: 8) { ProgressView(); Text(L("Checking Steam…")) }
+                } else {
+                    Text(L("Try Again"))
+                }
+            }
+            .disabled(steam.refreshing)
+            .padItem("search-steam-retry", cornerRadius: 12, inset: -6) { retry() }
+        }
+        .onAppear { LogStore.shared.log("[new-look] search: Steam can't be reached notice shown (cached games=\(steam.owned.count))") }
+    }
+    private var detail: String {
+        if let saved = steam.libraryUpdated, !steam.owned.isEmpty {
+            return String(format: L("Steam results use the list saved on this device on %@."),
+                          saved.formatted(date: .abbreviated, time: .shortened))
+        }
+        return L("Your Steam games that are not installed can't be searched until Steam can be reached. Check your internet connection.")
+    }
+    private func retry() {
+        guard !steam.refreshing else { return }
+        LogStore.shared.log("[new-look] search: Try Again asks Steam for the account's games")
+        Task { await SteamOwnedLibrary.shared.refreshLibrary(interactive: false) }
     }
 }
 
@@ -1786,16 +1783,20 @@ struct NewLookStoreGameArt: View {
     }
 }
 
-/// Search's "Type a name", only while the controller's highlight shows (iOS 18: the button
-/// needs .searchFocused). Its own view, so moving the highlight never redraws the results.
-private struct NewLookTypeButton: View {
+/// Search's "Type a Name" row, only while the controller's highlight shows: the field is Apple's
+/// (.searchable on this tab's page, LibraryView.lookStack) and the controller cannot reach it,
+/// so the row puts the keyboard up in it (iOS 18: .searchFocused). Its own view, so moving the
+/// highlight never redraws the results.
+private struct NewLookTypeRow: View {
     var field: FocusState<Bool>.Binding
     @ObservedObject private var pad = PadHighlight.shared
     var body: some View {
         if pad.shown {
             if #available(iOS 18.0, *) {
-                NewLookSheetButton(id: "search-field", title: L("Type a name"), symbol: "keyboard", action: { field.wrappedValue = true })
-                    .frame(maxWidth: 360)
+                Section {
+                    Button { field.wrappedValue = true } label: { Label(L("Type a Name"), systemImage: "keyboard") }
+                        .padItem("search-field", cornerRadius: 12, inset: -6) { field.wrappedValue = true }
+                }
             }
         }
     }
@@ -1810,165 +1811,94 @@ private struct NewLookSearchFocus: ViewModifier {
     }
 }
 
-/// A Search result: its picture, name, a line under it, and a chevron.
-struct NewLookSearchRow<Leading: View>: View {
-    let id: String
-    let last: Bool
-    let title: String
-    let note: String
-    let action: () -> Void
-    @ViewBuilder var leading: () -> Leading
-    var body: some View {
-        Button(action: action) {
-            HStack(spacing: 12) {
-                leading()
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title).font(.headline).lineLimit(2).foregroundStyle(.primary)
-                    if !note.isEmpty { Text(note).font(.subheadline).foregroundStyle(.secondary).lineLimit(2) }
-                }
-                Spacer(minLength: 8)
-                Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
-            }
-            .padding(.horizontal, 16).padding(.vertical, 12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .overlay(alignment: .bottom) {
-            if !last { Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 0.5).padding(.leading, 16 + 46 + 12) }
-        }
-        .padItem(id, cornerRadius: NewLook.cardRadius, inset: 4, press: action)
-    }
-}
-
 // MARK: - Settings
 
-/// The Settings tab: the JIT pill, then the Settings pages in their groups, each a row with
-/// its coloured icon (the pages themselves are the same as before).
+/// The Settings tab, Apple's grouped list: how things stand (JIT, Memory+, free space, games
+/// ready, and Madeira's version), then the Settings pages in their groups, each a row with its
+/// coloured icon.
 struct NewLookSettingsList: View {
+    var top = 0
     let enableJIT: () -> Void
     let open: (SettingsPages.Page) -> Void
-    @ObservedObject private var jitState = LibraryJITState.shared
-    @ObservedObject private var liquidMetal = LiquidMetalSetting.shared
+    @ObservedObject private var jit = LibraryJITState.shared
+    @ObservedObject private var starter = NewLookJITStart.shared
+    @ObservedObject private var games = NewLookGames.shared
+    @State private var memory: Bool?
+    @State private var free: Int64?
     var body: some View {
-        VStack(alignment: .leading, spacing: 24) {
-            NewLookTitle(title: L("Settings")) { NewLookStatusPill(enableJIT: enableJIT) }
-            // How things stand, in four tiles (the mock-up's Settings; Cameron, Nov 9: follow the mock-up).
-            NewLookStatusTiles()
-            ForEach(Array(SettingsPages.newLookGroups.enumerated()), id: \.offset) { _, group in
+        NewLookListPage(top: top, topID: jit.enabled ? "set-status" : "status") {
+            Section {
+                // JIT off: the row is the button that starts it (status sits next to what it
+                // describes: Apple rulebook 11.27).
+                if jit.enabled {
+                    LabeledContent(L("JIT"), value: L("On")).id("set-status")
+                } else {
+                    Button { starter.start(enableJIT) } label: {
+                        HStack {
+                            Text(starter.starting ? L("Enabling JIT…") : L("Enable JIT"))
+                            Spacer()
+                            if starter.starting { ProgressView() }
+                        }
+                    }
+                    .disabled(starter.starting)
+                    .padItem("status", cornerRadius: 12, inset: -6) { starter.start(enableJIT) }
+                }
+                if let memory { LabeledContent(L("Memory+"), value: memory ? L("On") : L("Off")) }
+                LabeledContent(L("Free space"), value: free.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "–")
+                LabeledContent(L("Games ready"), value: String(games.all.count))
+            } footer: {
+                // Each technical word is said in plain ones (Apple rulebook 16.5).
+                Text(L("JIT lets games run fast. Madeira needs it to play.") + " "
+                     + L("Memory+ lets games use more of this device's memory. It depends on how this copy of Madeira was signed."))
+            }
+            ForEach(Array(SettingsPages.groups.enumerated()), id: \.offset) { _, group in
                 let pages = group.1.filter(\.shown)
                 if !pages.isEmpty {
-                    NewLookSection(title: group.0.map { L($0) }) {
-                        ForEach(Array(pages.enumerated()), id: \.element) { index, page in
-                            Button { open(page) } label: {
-                                HStack(spacing: 16) {
-                                    NewLookBadge(symbol: page.symbol, color: page.color)
-                                    Text(L(page.title)).font(.body).foregroundStyle(.primary).lineLimit(2)
-                                    Spacer(minLength: 8)
-                                    if let value = summary(page) {
-                                        Text(value).font(.body).foregroundStyle(.secondary).lineLimit(1)
-                                    }
-                                    Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
-                                }
-                                .padding(.horizontal, 16).frame(maxWidth: .infinity, minHeight: 52, alignment: .leading)
-                                .contentShape(Rectangle())
+                    Section {
+                        ForEach(pages, id: \.self) { page in
+                            NewLookLinkRow(id: "set-" + page.key, title: L(page.title), action: { open(page) }) {
+                                NewLookBadge(symbol: page.symbol, color: page.color)
                             }
-                            .buttonStyle(.plain)
-                            .overlay(alignment: .bottom) {
-                                if index < pages.count - 1 { Rectangle().fill(Color.primary.opacity(0.12)).frame(height: 0.5).padding(.leading, 16 + 30 + 16) }
-                            }
-                            .accessibilityElement(children: .combine)
-                            .accessibilityAddTraits(.isButton)
-                            .padItem("set-" + page.key, cornerRadius: NewLook.cardRadius, inset: 4) { open(page) }
                         }
+                    } header: {
+                        if let title = group.0 { Text(L(title)) }
                     }
                 }
             }
-        }
-    }
-
-    private func summary(_ page: SettingsPages.Page) -> String? {
-        switch page {
-        case .jit: return jitState.enabled ? L("On") : L("Off")
-        case .appearance: return NewLook.enabled ? L("New look") : (liquidMetal.on ? L("Liquid metal") : L("Liquid Glass"))
-        default: return nil
-        }
-    }
-}
-
-/// Free space and games ready, each a big number in a tile, at the top of Settings. JIT and
-/// Memory+ are the pills beside the title (Cameron, Test 6: JIT twice in Settings was redundant).
-struct NewLookStatusTiles: View {
-    @ObservedObject private var games = NewLookGames.shared
-    @State private var free: Int64?
-    var body: some View {
-        let ready = games.all.count
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 12)], spacing: 12) {
-            tile(L("Free space"), free.map { Self.gigabytes($0) } ?? "–", unit: free == nil ? nil : "GB")
-            tile(L("Games ready"), "\(ready)")
+            Section {
+                // Which Madeira is installed (BuildStamp), where a player looks for it and can copy it
+                // into a report (Apple rulebook 9.49).
+                LabeledContent(L("Version")) { Text(BuildStamp.text).textSelection(.enabled) }
+            }
         }
         .task {
+            memory = EntitlementStatus.check().increasedMemory
             free = (try? LibraryModel.documents.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
                 .volumeAvailableCapacityForImportantUsage
         }
     }
-    private func tile(_ name: String, _ value: String, unit: String? = nil, color: Color = .primary) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(name).font(.footnote).foregroundStyle(.secondary)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(value).font(.title.bold()).foregroundStyle(color).lineLimit(1).minimumScaleFactor(0.6)
-                if let unit { Text(unit).font(.subheadline.weight(.semibold)).foregroundStyle(.secondary) }
-            }
-        }
-        .padding(.horizontal, 16).padding(.vertical, 12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .newLookCard(NewLook.cardRadius)
-        .accessibilityElement(children: .combine)
-    }
-    /// 212 GB, 9.5 GB: whole numbers from 10 up (decimal gigabytes, as Files shows them).
-    static func gigabytes(_ bytes: Int64) -> String {
-        let gb = Double(bytes) / 1_000_000_000
-        return gb >= 10 ? String(Int(gb)) : String(format: "%.1f", gb)
-    }
 }
 
-/// A Settings page in the new look: the island behind it, and B goes back.
+/// A Settings page: B goes back. The page is Apple's grouped form on its own background.
 struct NewLookSettingsChrome: ViewModifier {
     @Environment(\.dismiss) private var dismiss
-    @ViewBuilder func body(content: Content) -> some View {
-        if NewLook.enabled {
-            content
-                .scrollContentBackground(.hidden)
-                .background { NewLookBackground().ignoresSafeArea() }
-                .padLayer("settings-page", back: { dismiss() }, page: true)
-        } else {
-            content
-        }
+    func body(content: Content) -> some View {
+        content.padLayer("settings-page", back: { dismiss() }, page: true)
     }
 }
 
-// MARK: - Game page parts
+// MARK: - Shared row parts
 
-/// A group of rows on the game page, with its heading.
-struct NewLookSection<Content: View>: View {
-    let title: String?
-    @ViewBuilder var content: () -> Content
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if let title { Text(title).font(.title3.bold()).padding(.horizontal, 4).accessibilityAddTraits(.isHeader) }
-            VStack(spacing: 0) { content() }.newLookCard()
-        }
-    }
-}
-
-/// A colored rounded-square icon, as in Settings.
+/// A colored rounded-square icon, as in Apple's Settings. It grows with the text size
+/// (Apple rulebook 3.13).
 struct NewLookBadge: View {
     let symbol: String
     let color: Color
+    @ScaledMetric(relativeTo: .body) private var side: CGFloat = 30
     var body: some View {
-        Image(systemName: symbol).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
-            .frame(width: 30, height: 30)
-            .background(color, in: RoundedRectangle(cornerRadius: NewLook.badgeRadius, style: .continuous))
+        Image(systemName: symbol).font(.system(size: side * 0.5, weight: .semibold)).foregroundStyle(.white)
+            .frame(width: side, height: side)
+            .background(color, in: RoundedRectangle(cornerRadius: side * 0.27, style: .continuous))
             .accessibilityHidden(true)
     }
 }
@@ -1980,12 +1910,28 @@ struct LibraryReadyGame: Identifiable {
     let id: String
     let entry: LibraryEntry
     let store: String
+    /// When it was last played: the later of Madeira's own record (LibraryModel.begin stamps it
+    /// at every start) and, for a Steam game, Steam's own (the account's playtime record, which
+    /// Valve's client updates when the game runs). The Library's order and its top card follow it
+    /// (Cameron, Nov 11: the top card "should be last played"; on Nov 10 it showed a game from
+    /// Nov 8 after he had played Borderlands 2).
+    var played: Date? = nil
     /// Its id in the Library grid's highlight (and the grid's ForEach, for scrolling to it).
     var padID: String { "g-" + id }
 
+    /// The later of the two records (see `played`).
+    static func lastPlayed(_ entry: LibraryEntry, steam: [Int: SteamPlaytime]) -> Date? {
+        let own = entry.lastPlayed
+        let theirs = entry.steamAppID.flatMap { steam[$0] }.flatMap { $0.lastPlayed > 0 ? Date(timeIntervalSince1970: TimeInterval($0.lastPlayed)) : nil }
+        switch (own, theirs) {
+        case let (a?, b?): return max(a, b)
+        default: return own ?? theirs
+        }
+    }
+
     /// "Steam · Played yesterday", "Epic Games · Not played yet".
     var note: String {
-        guard let played = entry.lastPlayed else { return store + " · " + L("Not played yet") }
+        guard let played else { return store + " · " + L("Not played yet") }
         let calendar = Calendar.current
         if calendar.isDateInToday(played) { return store + " · " + L("Played today") }
         if calendar.isDateInYesterday(played) { return store + " · " + L("Played yesterday") }
@@ -2034,10 +1980,12 @@ struct LibraryReadyGame: Identifiable {
             games.append(.init(id: "entry:" + entry.id.uuidString, entry: entry, store: L("Other games")))
         }
         let query = search.trimmingCharacters(in: .whitespaces)
+        let steam = SteamOwnedLibrary.shared.playtime
+        for i in games.indices { games[i].played = lastPlayed(games[i].entry, steam: steam) }
         return games
             .filter { query.isEmpty || $0.entry.title.localizedCaseInsensitiveContains(query) }
             .sorted {
-                if $0.entry.lastPlayed != $1.entry.lastPlayed { return ($0.entry.lastPlayed ?? .distantPast) > ($1.entry.lastPlayed ?? .distantPast) }
+                if $0.played != $1.played { return ($0.played ?? .distantPast) > ($1.played ?? .distantPast) }
                 return $0.entry.title.localizedStandardCompare($1.entry.title) == .orderedAscending
             }
     }
@@ -2063,6 +2011,8 @@ struct LibraryReadyGame: Identifiable {
             SteamGamesModel.shared.$games.map { $0.filter(\.installed).map(\.id) }.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
             SteamGamesModel.shared.$scanned.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
             SteamOwnedLibrary.shared.$downloads.map { Set($0.keys) }.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
+            // Steam's own last-played times (the order follows them too; minutes alone change nothing here).
+            SteamOwnedLibrary.shared.$playtime.map { $0.mapValues(\.lastPlayed) }.removeDuplicates().map { _ in () }.eraseToAnyPublisher(),
         ]
         changes.append(EpicLibrary.shared.$installed.map { Set($0.keys) }.removeDuplicates().map { _ in () }.eraseToAnyPublisher())
         changes.append(EpicLibrary.shared.$downloads.map { Set($0.keys) }.removeDuplicates().map { _ in () }.eraseToAnyPublisher())
@@ -2094,9 +2044,13 @@ struct LibraryReadyGame: Identifiable {
 
     private func rebuild() {
         let games = LibraryReadyGame.all(search: "")
-        if games.map(\.id) != all.map(\.id) || games.map(\.entry.lastPlayed) != all.map(\.entry.lastPlayed)
+        if games.map(\.id) != all.map(\.id) || games.map(\.played) != all.map(\.played)
             || games.map(\.entry.title) != all.map(\.entry.title) || games.map(\.entry.coverFile) != all.map(\.entry.coverFile) {
             all = games
+            // In the log: which game the Library puts first, and when it was played.
+            if let first = games.first {
+                LogStore.shared.log("[new-look] library order: first=\(first.entry.title) played=\(first.played?.ISO8601Format() ?? "never") (Madeira \(first.entry.lastPlayed?.ISO8601Format() ?? "never")) games=\(games.count)")
+            }
         }
         let scanned = SteamGamesModel.shared.scanned
         if scanned != steamScanned { steamScanned = scanned }
@@ -2121,14 +2075,17 @@ struct NewLookStep: Identifiable {
     var state: State
 }
 
-/// A step tile: its badge, what it is, and done (a tick), running (a spinner), waiting or failed.
+/// A step: its badge, what it is, and done (a tick), running (a spinner), waiting or failed,
+/// each also said in words for VoiceOver (Apple rulebook 4.2). On the starting screen it is a
+/// tile; `plain` is a row of a list (Downloads).
 struct NewLookStepTile: View {
     let step: NewLookStep
+    var plain = false
     var body: some View {
-        HStack(spacing: 12) {
-            NewLookBadge(symbol: step.symbol, color: Color(white: 0.39))
+        let row = HStack(spacing: 12) {
+            NewLookBadge(symbol: step.symbol, color: Color(uiColor: .systemGray))
             VStack(alignment: .leading, spacing: 2) {
-                Text(step.title).font(.body.weight(.semibold)).lineLimit(2)
+                Text(step.title).font(plain ? .body : .body.weight(.semibold))
                 if let detail = step.detail, !detail.isEmpty {
                     Text(detail).font(.footnote).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -2137,28 +2094,32 @@ struct NewLookStepTile: View {
             Spacer(minLength: 8)
             switch step.state {
             case .done:
-                Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(NewLookColor.green)
+                Image(systemName: "checkmark.circle.fill").font(.title3).foregroundStyle(.green)
                     .accessibilityLabel(L("Done"))
             case .active:
-                ProgressView().tint(.primary).accessibilityLabel(L("In progress"))
+                ProgressView().accessibilityLabel(L("In progress"))
             case .waiting:
-                Circle().strokeBorder(Color.primary.opacity(0.35), lineWidth: 2).frame(width: 20, height: 20)
+                Image(systemName: "circle").font(.title3).foregroundStyle(.tertiary)
                     .accessibilityLabel(L("Waiting"))
             case .failed:
-                Image(systemName: "xmark.circle.fill").font(.title3).foregroundStyle(NewLookColor.red)
+                Image(systemName: "xmark.circle.fill").font(.title3).foregroundStyle(.red)
                     .accessibilityLabel(L("Stopped"))
             }
         }
-        .padding(.horizontal, 12).padding(.vertical, 12)
-        .frame(minHeight: 54)
-        .background(RoundedRectangle(cornerRadius: NewLook.coverRadius, style: .continuous).fill(fill))
-        .accessibilityElement(children: .combine)
+        if plain {
+            row.accessibilityElement(children: .combine)
+        } else {
+            row.padding(12)
+                .frame(minHeight: 54)
+                .background(RoundedRectangle(cornerRadius: NewLook.coverRadius, style: .continuous).fill(fill))
+                .accessibilityElement(children: .combine)
+        }
     }
     private var fill: Color {
         switch step.state {
-        case .active: return NewLookColor.link.opacity(0.2)
-        case .failed: return NewLookColor.red.opacity(0.18)
-        default: return Color.primary.opacity(0.08)
+        case .active: return Color.accentColor.opacity(0.2)
+        case .failed: return Color.red.opacity(0.18)
+        default: return Color(uiColor: .tertiarySystemFill)
         }
     }
 }

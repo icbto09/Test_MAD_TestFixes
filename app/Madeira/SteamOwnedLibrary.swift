@@ -304,6 +304,10 @@ final class SteamOwnedLibrary: ObservableObject {
     private(set) var ownedRevision = 0
     @Published private(set) var refreshing = false
     @Published private(set) var libraryUpdated: Date?
+    /// The last time asking Steam for the account's games failed for a reason other than an
+    /// expired sign-in (no connection, Steam down); nil once a request works again. Search says
+    /// so instead of quietly finding nothing (Cameron, Nov 11 2026).
+    @Published private(set) var libraryUnreachable: Date?
     /// Steam's playtime and last played, by App ID.
     @Published private(set) var playtime: [Int: SteamPlaytime] = [:]
     @Published var error: String?
@@ -415,7 +419,7 @@ final class SteamOwnedLibrary: ObservableObject {
             for id in Array(downloads.keys) { pause(id) }
             session.logoff()
             clearCaches()
-            owned = []; libraryUpdated = nil; playtime = [:]; downloads = [:]
+            owned = []; libraryUpdated = nil; playtime = [:]; downloads = [:]; libraryUnreachable = nil
             SteamLog.event("[steam-library] signed out: list cleared")
         } else {
             owned = []; libraryUpdated = nil; playtime = [:]
@@ -461,11 +465,15 @@ final class SteamOwnedLibrary: ObservableObject {
                 .sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
             owned = games
             libraryUpdated = Date()
+            libraryUnreachable = nil
             cachedAccount = Self.accountKey(SteamSignIn.accountName)
             writeCache()
             SteamLog.event("[steam-library] owned apps=\(apps.count) windows-installable=\(games.count) dlc=\(ownedDLC.count)")
             await refreshPlaytime()
         } catch {
+            if case SteamError.logonDenied(let code) = error, SteamError.signInExpiredCodes.contains(code) {} else {
+                libraryUnreachable = Date()
+            }
             handleSessionError(error, context: "library", report: interactive)
         }
     }

@@ -268,14 +268,10 @@ enum LogTrail {
 
     /// The ring's place now, for a press's before and after.
     @MainActor static var ring: String {
-        if PadHighlight.enabled {
-            let pad = PadHighlight.shared
-            guard let focus = pad.focus else { return pad.shown ? "on nothing" : "hidden" }
-            return (pad.shown ? focus : "hidden (was \(focus))") + (pad.layerName == PadLayer.root ? "" : " in \(pad.layerName)")
-        }
-        let pad = MenuPad.shared
-        guard let focus = pad.focus else { return pad.ring ? "on nothing" : "hidden" }
-        return pad.ring ? focus : "hidden (was \(focus))"
+        guard PadHighlight.enabled else { return "off" }
+        let pad = PadHighlight.shared
+        guard let focus = pad.focus else { return pad.shown ? "on nothing" : "hidden" }
+        return (pad.shown ? focus : "hidden (was \(focus))") + (pad.layerName == PadLayer.root ? "" : " in \(pad.layerName)")
     }
 
     static let buttonNames: [String: String] = [
@@ -292,7 +288,7 @@ enum LogTrail {
             MainActor.assumeIsolated {
                 let after = ring
                 let moved = after == before ? "ring \(before)" : "ring \(before) -> \(after)"
-                let sheets = MenuPad.shared.sheets
+                let sheets = PadHighlight.shared.sheets
                 write(.pad, "[pad] \(button) (\(command)): \(moved) on \(screen)" + (sheets > 0 ? ", \(sheets) sheet(s) open" : ""))
             }
         }

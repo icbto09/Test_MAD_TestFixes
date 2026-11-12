@@ -631,7 +631,7 @@ struct OnboardingView: View {
                     if let error = dock.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(dock.error == nil ? "Download components" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(dock.error == nil ? "Download components" : "Try Again", symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] components download")
                         dock.prepareClient()
                     }
@@ -665,7 +665,7 @@ struct OnboardingView: View {
                     if let error = mono.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(mono.error == nil ? "Download Wine Mono" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(mono.error == nil ? "Download Wine Mono" : "Try Again", symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] Wine Mono download")
                         mono.install()
                     }
@@ -700,7 +700,7 @@ struct OnboardingView: View {
                     if let error = redist.error {
                         Label(error, systemImage: "exclamationmark.circle.fill").foregroundStyle(.red)
                     }
-                    primary(redist.error == nil ? "Download and install" : "Try again", symbol: "arrow.down.circle.fill") {
+                    primary(redist.error == nil ? "Download and install" : "Try Again", symbol: "arrow.down.circle.fill") {
                         LogStore.shared.log("[onboarding] Visual C++ runtime install")
                         redist.install()
                     }

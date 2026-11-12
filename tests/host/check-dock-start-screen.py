@@ -69,14 +69,18 @@ poll = library[library.index('    private func poll() {'):]
 poll = poll[:poll.index('\n    }\n')]
 require(poll.index('if dockStart.holding {') < poll.index('showGameView(reason: "surface")'),
         "while the hold is on, the desktop's first frame does not end the starting screen")
-row = library[library.index("The starting screen's controls are one row of glyph-only buttons"):]
-row = row[:row.index('if model.launchSlow')]
-require('HStack(spacing: 14)' in row, 'one row of glyph buttons')
-order = [row.index('L("Close session"), "stop.circle"'), row.index('L("Hide live log") : L("Show live log"), "text.alignleft"'),
-         row.index('L("Show desktop"), "macwindow"')]
-require(order == sorted(order), 'glyph order: close session, live log, show desktop')
-require('if dockStart.failure != nil {' not in row and 'if dockStart.holding {' in row and 'dockStart.showDesktop(model)' in row,
-        'close session all the time on the starting screen; show desktop only while the desktop is held back')
+# One UI (Nov 10): one starting screen (MARK: - New look: the starting screen). Its controls are
+# worded buttons: Stop once the session has begun, the live log, and Show Desktop only while a
+# Dock start holds the desktop back.
+new = library[library.index('// MARK: - New look: the starting screen'):]
+row = new[new.index('@ViewBuilder fileprivate var lookControls: some View {'):]
+row = row[:row.index('fileprivate func lookFailure(')]
+order = [row.index('NewLookSheetButton(id: "ln-stop", title: L("Stop")'), row.index('NewLookSheetButton(id: "ln-log"'),
+         row.index('NewLookSheetButton(id: "ln-desktop", title: L("Show Desktop")')]
+require(order == sorted(order), 'button order: Stop, live log, Show Desktop')
+require('if dockStart.failure != nil {' not in row and 'if dockStart.holding {' in row and 'dockStart.showDesktop(model)' in row
+        and 'if model.current != nil {\n                NewLookSheetButton(id: "ln-stop"' in row,
+        'Stop once the session has begun; Show Desktop only while the desktop is held back')
 # Close session on the starting screen goes back to the library at once: it asks the game to
 # close and closes the desktop, then ends the session's screens (finish), with no wait.
 close = library[library.index('    func stopStartToLibrary() {'):]
@@ -93,34 +97,30 @@ require(quit.index('requestQuit()') < quit.index('finish()') < quit.index('while
 require('Button(role: .destructive) { model.quitToLibrary() }' in library and '{ model.requestQuit() }' not in library,
         'the in-game Quit game uses quitToLibrary')
 require('whileClosing || wine_process_is_running() == 0' in library, 'the ended-desktop hide can skip the wait for Wine')
-require(row.count('{ model.stopStartToLibrary() }') == 1 and library.count('{ model.stopStartToLibrary() }') == 4 and 'model.requestQuit() }' not in row,
-        'both starting-screen layouts and the new look\'s Stop and Close use stopStartToLibrary')
-require(library.count('if model.current != nil {\n                        launchGlyph(L("Close session"), "stop.circle")') == 2,
-        'Close session shows once the session has begun')
+require(row.count('{ model.stopStartToLibrary() }') == 1 and library.count('{ model.stopStartToLibrary() }') == 2 and 'model.requestQuit() }' not in new,
+        'the starting screen\'s Stop and, once it stopped, Close use stopStartToLibrary')
 content = (root / 'app/Madeira/ContentView.swift').read_text()
 for held in ('[session-once] launch held', '[session-once] Dock launch held'):
     k = content.index(held)
     require(content.rfind('MADEIRA_ONE_SESSION_PER_RUN', 0, k) > content.rfind('A session is already running.', 0, k),
             'a second start after Stop says to restart Madeira, not that a session is running')
-require('Text("Madeira Dock stopped")' in library and 'DockInstallers.note' in library and 'DockStartStatus.text(' in library,
+require('Label("Madeira Dock stopped", systemImage: "exclamationmark.triangle.fill")' in new and 'DockInstallers.note' in new and 'DockStartStatus.text(' in library,
         'the starting screen shows the Dock status, the one-time-install note, and a stop with its words')
 
-# A stopped Dock start keeps the elapsed-time line (portrait and landscape).
-old = library[:library.index('// MARK: - New look: the starting screen')]
-stopped = [m.start() for m in re.finditer(r'Text\("Madeira Dock stopped"\)', old)]
-new = library[library.index('// MARK: - New look: the starting screen'):]
-require('Text("Madeira Dock stopped")' in new and 'timeIntervalSince(model.startingSince)' in new[:new.index('lookSteps(entry)')],
-        'the new look: the elapsed time sits under the title, stopped or not')
-require(len(stopped) == 2 and all('timeIntervalSince(model.startingSince)' in library[i:library.index('} else', i)] for i in stopped),
-        'the stopped starting screen still shows the elapsed time')
+# A stopped Dock start keeps the elapsed-time line: it sits under the title, stopped or not.
+require('timeIntervalSince(model.startingSince)' in new[:new.index('lookSteps(entry)')]
+        and new.index('lookSteps(entry)') < new.index('if failed { lookFailure(entry) } else { lookControls }'),
+        'the elapsed time sits under the title, stopped or not')
 
 status = library[library.index('    private var dockStatus: String {'):]
 status = status[:status.index('\n    }\n')]
 require(status.index('DockInstallers.poll(drive: MadeiraDock.drive)') < status.index('DockInstallers.finishedAt ?? model.launchStartedAt')
         and 'installsFinished: DockInstallers.finishedAt != nil' in status and 'waited: Date().timeIntervalSince(hostDue)' in status,
         "the status line reads the installs' end after polling them, and times the host from it (or from the start)")
-require('SteamGameArtwork(appID: appID)' in library and 'SteamLaunchBackdrop(appID: appID)' in library,
-        "a Dock start shows the game's cover and backdrop by App ID")
+# One UI (Nov 10): the backdrop behind the starting screen is the dark island (NewLookBackground);
+# the game's cover is still read by App ID.
+require('SteamGameArtwork(appID: appID)' in library and 'SteamLaunchBackdrop.hero(appID)' in library,
+        "a Dock start shows the game's cover by App ID")
 require('winios_window_census_enable(1)' in screen and screen.count('winios_window_census_enable(0)') == 2
         and 'winios_window_census_enable(reason == "game-window" ? 2 : 0)' in screen,
         'the census runs only while a Dock start holds the desktop back; after the game window, only the '

@@ -53,9 +53,13 @@ for path in sources:
 
 library = (app / 'Library.swift').read_text()
 require('var gogProductID: String?' in library, 'library entries record their GOG product')
-require(library.count('$0.epicAppName == nil && $0.gogProductID == nil') >= 2,
+# One UI (Nov 10): the store's games are listed on its Stores page (NewLook.swift) and its
+# settings on its Settings page (SettingsPages.swift); Other games is the added() list.
+pages_ui = (app / 'SettingsPages.swift').read_text()
+newlook_ui = (app / 'NewLook.swift').read_text()
+require('&& entry.gogProductID == nil' in newlook_ui[newlook_ui.index('@MainActor static func added() -> [LibraryEntry] {'):],
         'Other games: no GOG game (it is listed in the GOG section)')
-require('case .gogSignIn: GOGSignInView()' in library and 'gogSignIn' in library[library.index('enum SettingsSheet'):],
+require('case .gogSignIn: GOGSignInView()' in pages_ui and 'gogSignIn' in library[library.index('enum SettingsSheet'):],
         'Settings: the GOG sign-in sheet')
 content = (app / 'ContentView.swift').read_text()
 require('case .gogSignIn: GOGSignInView()' in content, 'the developer strip handles the GOG sign-in sheet')

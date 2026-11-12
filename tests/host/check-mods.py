@@ -52,9 +52,9 @@ strings = json.loads((app / 'Localizable.xcstrings').read_text(encoding='utf-8')
 check('case .mods: return "Mods"' in library and 'case .mods: return "puzzlepiece.extension"' in library,
       'Game details has a Mods page with its title and icon')
 check('[.library, .iniFiles, .mods, .advanced]' in library, 'the Mods row sits above Advanced, for every game but the Desktop')
-check('detailRow("page:\\(item)", last: item == group.last, tap: { open(item) }) { pageRowLabel(item) }' in library and
-      'pageGroups.flatMap { $0 }.map { "page:\\($0)" }' in library,
-      'its row is a detailRow, so the controller ring stops on it and A opens it')
+# One UI (Nov 10): the game's page is Apple's list; each page row carries the controller's highlight.
+check('NewLookLinkRow(id: "gp-page-\\(item)", title: L(item.title), note: item.blurb, value: summary(item),' in library,
+      "its row is on the game's page, where the controller's highlight stops on it and A opens it")
 check('case .mods: ModsPage(game: modGame)' in library, 'the page opens ModsPage')
 model = library[library.index('    private var modGame: ModGame {'):]
 model = model[:model.index('\n    }\n') + 6]
@@ -85,7 +85,10 @@ check('static let entry = "winhttp=n,b"' in core, 'BepInEx: winhttp=n,b')
 
 # 4. The page and the sheet.
 check('.interactiveDismissDisabled(true)' in view, "the install sheet can't be swiped away while it works")
-check('asCopy: true' in view and 'folder ? [.folder]' in view, 'Choose a File and Choose a Folder both copy what is picked')
+# Mods folder fix (Nov 10, Test 8 crash): a folder cannot be opened with asCopy, so only a file
+# is copied by the picker; a folder is read in place under its security scope.
+check('asCopy: !folder' in view and 'folder ? [.folder]' in view and 'startAccessingSecurityScopedResource()' in view,
+      'Choose a File copies what is picked; Choose a Folder opens it in place (no asCopy for a folder)')
 check('if ModInstaller.isPickerCopy(source) { try? FileManager.default.removeItem(at: source) }' in view,
       "only the picker's own copy is deleted after an install, never the person's file or folder")
 check('ItchArchive.unpackAny(' in archive and 'ItchArchive.unpackInner(' in archive, '.zip and .7z (and archives inside) through ItchArchive')

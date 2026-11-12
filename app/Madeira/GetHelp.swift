@@ -27,6 +27,9 @@
 //                 need names up to 2, and the app asks again with follow_up + files (GetHelpFiles.swift).
 //  POST /feedback {request_id, helped}
 //  POST /upload   (sentry-full-log) a .zip of the full scrubbed logs, header x-request-id
+//                 -> 200 {ok:true} or {ok:true,late:true}; 404 {error:"unknown"}: the report is gone.
+//                 (late-zip) A zip that did not get there (Madeira closed first) is sent again on
+//                 the next open, up to 7 days later (GetHelpCore.Late, GetHelpUpload.resendLate).
 //
 
 import Foundation
@@ -246,5 +249,90 @@ enum GetHelpCore {
         var game: String
         var date: String
         var added: [String]
+    }
+
+    // MARK: Late zip (late-zip)
+
+    /// (late-zip) An upload that has not reached the server yet: Application Support/get-help-pending/
+    /// <request id>.json, written before the upload waits or zips, so the zip can be made again when
+    /// Madeira closed (or iOS ended it) first. The server takes a late zip for 7 days.
+    struct Pending: Codable, Equatable {
+        var requestID: String
+        var title: String
+        var windowsPath: String
+        var report: String
+        var gameText: String?
+        var device: String
+        var created: Date
+    }
+
+    /// (late-zip) The parts of the late zip that need no app: names, age, which answers are final.
+    enum Late {
+        static let folderName = "get-help-pending"
+        /// The server keeps a report waiting for its zip this long.
+        static let maxAge: TimeInterval = 7 * 24 * 60 * 60
+        /// At most this many late zips per launch, one at a time.
+        static let perLaunch = 3
+        /// Seconds after launch before the first late zip goes.
+        static let startDelay: TimeInterval = 5
+
+        /// A request id the server made (a UUID): letters, digits and "-" only, so it is safe as a file name.
+        static func safeID(_ id: String) -> Bool {
+            !id.isEmpty && id.count <= 80 && id.allSatisfy { ($0.isASCII && ($0.isLetter || $0.isNumber)) || $0 == "-" }
+        }
+        static func jsonName(_ id: String) -> String { id + ".json" }
+        static func zipName(_ id: String) -> String { id + ".zip" }
+        /// The request id from a pending file's name; nil for any other file.
+        static func id(fromFileName name: String) -> String? {
+            for ext in [".json", ".zip"] where name.hasSuffix(ext) {
+                let id = String(name.dropLast(ext.count))
+                return safeID(id) ? id : nil
+            }
+            return nil
+        }
+        /// The log's short form of an id.
+        static func short(_ id: String) -> String { String(id.prefix(8)) }
+
+        /// Still worth sending: under 7 days old (a date ahead of the clock by more than a day is not trusted).
+        static func fresh(_ created: Date, now: Date = Date()) -> Bool {
+            let age = now.timeIntervalSince(created)
+            return age < maxAge && age > -24 * 60 * 60
+        }
+
+        /// What an upload's answer means for the pending files. 2xx: it arrived. 404: the report is
+        /// gone for good. Any other 4xx (401, 400, 413...): sending again would get the same answer.
+        /// No answer (0), a time-out or a 5xx: keep them for the next open.
+        enum Verdict: Equatable { case done, keep }
+        static func verdict(status: Int?) -> Verdict {
+            guard let status, status > 0 else { return .keep }
+            if (200..<300).contains(status) || (400..<500).contains(status) { return .done }
+            return .keep
+        }
+
+        static func encode(_ pending: Pending) -> Data? {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            encoder.dateEncodingStrategy = .secondsSince1970
+            return try? encoder.encode(pending)
+        }
+        /// nil when the file can't be read or its id isn't safe (the caller deletes it).
+        static func decode(_ data: Data) -> Pending? {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .secondsSince1970
+            guard let pending = try? decoder.decode(Pending.self, from: data), safeID(pending.requestID) else { return nil }
+            return pending
+        }
+
+        /// Which pending ids to send this launch, oldest first, and which to delete (too old or unreadable).
+        /// `items`: id -> its Pending (nil when the .json is unreadable or missing).
+        static func plan(_ items: [String: Pending?], now: Date = Date()) -> (send: [Pending], delete: [String]) {
+            var send: [Pending] = [], delete: [String] = []
+            for (id, pending) in items {
+                guard let pending, pending.requestID == id, fresh(pending.created, now: now) else { delete.append(id); continue }
+                send.append(pending)
+            }
+            send.sort { $0.created < $1.created }
+            return (Array(send.prefix(perLaunch)), delete.sorted())
+        }
     }
 }

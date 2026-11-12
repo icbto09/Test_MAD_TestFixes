@@ -316,6 +316,7 @@ struct LogsSection: View {
             Text("Share Logs makes one text file (up to 5 MB) with the last game's log and your settings, with personal details taken out. Post it in the Madeira Discord. To send another log, tap it below and share it.")
         }
         .onAppear { reload() }
+        CrashReportsSection()   // (crash-reports) Send crash reports, CrashReports.swift
         Section {
             if main.isEmpty { Text("No logs yet. Play a game once and its log shows here.").foregroundStyle(.secondary) }
             ForEach(main) { row($0) }

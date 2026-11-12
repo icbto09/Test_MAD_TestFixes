@@ -1128,6 +1128,23 @@ enum GameRecommendations {
         env.MADEIRA_EC_HOOK_TRACE = 0
         """)
 
+    /// [melonloader] A game modded with MelonLoader 0.7 (recognised by its version.dll proxy and
+    /// MelonLoader folder beside the program), when the game has no list of its own. A Test 8 Get Help
+    /// report (PvZ Fusion, PlantsVsZombiesRH.exe, iPhone12,1): ~4 s in, version.dll asks for an unhinted
+    /// ~256 GB reservation, which cannot fit the map (c0000017), and the game stops with c0000602 every run.
+    /// After the player turned on oversize-reserve (Get Help's line), the same reservation was served
+    /// ("real 0x7400000000+16384 MB") and the c0000602 was gone in both later runs. So: the standard list
+    /// plus that one line. To switch it off, delete the line (or turn off Game details > Large memory
+    /// reservations). NOT device-tested by Cameron; checked in the player's logs only.
+    static let melonLoader = GameRecommendation(
+        id: "melonloader", title: "games modded with MelonLoader", version: 1,
+        config: """
+        # Madeira's recommended settings for a game modded with MelonLoader.
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        oversize-reserve = 1
+        """)
+
     /// The Rockstar Games Launcher outside Steam (Launcher.exe in its own folder;
     /// a tester's copy of a game bought there, 2026-10-28). Through Madeira Dock the
     /// game's own list carries the launcher chain's lines and the Dock starts the
@@ -1315,7 +1332,7 @@ enum GameRecommendations {
                       ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,
                       crysis2Remastered, crysis3Remastered, rockstarLauncher, rockstarLauncherSetup, battleNet, battleNetSetup,
                       steamBigPicture,
-                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, blackOps1, blackOps2, borderlands2, standard]
+                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, blackOps1, blackOps2, borderlands2, standard, melonLoader]
         + steamTitles.map(\.list)
 
     // MARK: Recognising a game
@@ -1443,7 +1460,18 @@ enum GameRecommendations {
         case "battle.net-setup.exe":
             return battleNetSetup
         default:
-            return steamTitles.first { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) }?.list
+            if let list = steamTitles.first(where: { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) })?.list {
+                return list
+            }
+            // [melonloader] A game modded with MelonLoader 0.7 (its version.dll proxy beside the
+            // program, and a MelonLoader folder), when no list of its own matched; not Unity's
+            // crash handler beside it.
+            let folder = path.lastIndex(of: "\\").map { String(path[..<$0]) } ?? ""
+            if !folder.isEmpty, !last.hasPrefix("unitycrashhandler"),
+               fileExists(folder + "\\version.dll"), fileExists(folder + "\\MelonLoader") {
+                return melonLoader
+            }
+            return nil
         }
     }
 
@@ -1549,6 +1577,8 @@ extension GameRecommendations {
                    programs: [], steamPrograms: ["subnautica2-win64-shipping.exe"], list: subnautica2),
         SteamTitle(appIDs: [962130], folders: ["grounded"],
                    programs: [], steamPrograms: ["maine-win64-shipping.exe"], list: grounded),
+        SteamTitle(appIDs: [526870], folders: ["satisfactory"],
+                   programs: [], steamPrograms: [], list: satisfactorySteam),
         SteamTitle(appIDs: [2668510], folders: ["red dead redemption"],
                    programs: [], steamPrograms: ["playrdr.exe"], list: rdr1Steam),
         SteamTitle(appIDs: [3764200], folders: ["resident evil requiem biohazard requiem"],
@@ -2265,6 +2295,38 @@ extension GameRecommendations {
         env.MADEIRA_JIT_DUMP = 0
         """,
         nvidia: true)
+
+    /// Satisfactory from Steam (App ID 526870, Unreal Engine 5, Direct3D 12). The owner's device-tested list for the
+    /// Epic copy (Wave 5, 2026-11-06: past the logo and in game, ~29 FPS on Low): the split JIT pool and uncopied
+    /// images make room for its ~300 module DLLs (the pool ran out without them), the ec-hook reporter is off, and
+    /// rp-carry/rp-discard skip the render-pass loads and stores it never uses. It was tested without the community
+    /// build's defaults, so none are added. A device with less than 10 GB of RAM also gets `satisfactorySmallRAMLines`:
+    /// a Test 8 report (Get Help, 2026-11-10, a 6 GB iPad, iOS's limit 4096 MB) reached the game window, then the
+    /// footprint climbed to 4053 MB and iOS ended Madeira. NOT device-tested from Steam or on a small device.
+    static let satisfactorySteam = GameRecommendation(
+        id: "satisfactory-steam", title: "Satisfactory (Steam)", version: 1,
+        config: """
+        # Madeira's recommended settings for Satisfactory (Steam).
+        # Reset to Recommended, at the bottom of the game's settings, brings them back.
+        pool-split = 1
+        env.MADEIRA_X64_IMAGE_NOCOPY = 1
+        env.MADEIRA_EC_HOOK_TRACE = 0
+        rp-carry = 1
+        rp-discard = 1
+        """,
+        smallRAMConfig: satisfactorySmallRAMLines)
+
+    /// Satisfactory on a device with less than 10 GB of RAM: the swap file (broad coverage, down to Unreal's 64 KB
+    /// reservations) takes the game's data and its pure-x64 images out of the memory iOS counts, and the game is
+    /// told it has 768 MB of video memory (the automatic budget was 1024 MB on the 6 GB iPad and trimmed itself
+    /// to 768 MB before the end), so Unreal's texture pool starts smaller. The lines Grounded's tested list uses.
+    static let satisfactorySmallRAMLines = """
+        swap-mb = 8192
+        swap-mode = 2
+        swap-images = 1
+        vram-mb = 768
+        env.MADEIRA_SWAP_MIN_KB = 64
+        """
 
     /// Red Dead Redemption (Steam) (Steam App ID 2668510). Ported on 2026-10-26 from thebcd69's (BCD) tested list for
     /// it (its version 1); not device-tested here.

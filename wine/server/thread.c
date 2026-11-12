@@ -1788,7 +1788,7 @@ static int ios_apc_requeue_enabled( void )
         enabled = !(e && e[0] == '0');
         fprintf( stderr, "[apc-requeue] %s (MADEIRA_APC_REQUEUE=0 restores dropping async I/O APCs "
                  "for busy threads)\n", enabled ? "on" : "off" );
-        if (enabled) ios_apc_busy_queue_enabled();   /* iOS-Madeira: says so once if the switch is set */
+        if (enabled) ios_apc_busy_queue_enabled();   /* iOS-Madeira: says once whether the busy queue is on */
     }
     return enabled;
 }
@@ -1808,15 +1808,22 @@ static int ios_apc_requeue_enabled( void )
  * (DTF's RemotableNativeMethods reads a response through a NULL pointer, Mono raises
  * NullReferenceException) failed: JunoInitializeSession returned 1603.
  *
- * With MADEIRA_APC_BUSY_QUEUE=1 the APC stays on the busy thread when nobody else can take it. The
- * thread runs it at its next wait in the server: check_wait returns STATUS_KERNEL_APC for any
- * interruptible wait, and a fastsync wait parks in process for at most MADEIRA_FASTSYNC_CAP_US (2 ms)
- * before it falls through to the server. It is not done when the process has the in-process engine
- * (madsync: thread->alert_sync exists), where a wait can sit outside the server without a bound
- * and a system APC does not interrupt it (the services.exe case described above). Off (unset or
- * anything but 1) nothing changes: the APC is dropped as before. It is set per program (a launcher
- * entry, or the app's auto-tune after the failure); a working program never sees the new path.
- * [apc-requeue] says "kept on the busy thread" for these. */
+ * Valve's 32-bit SteamService.exe, which Madeira Dock runs with /install to register Steam's client
+ * service on a new prefix, is the same case: one thread, and its OpenSCManager's RPC bind on
+ * \pipe\svcctl got the services.exe bind-ack while that thread was still running. The read ended
+ * with no data ("RpcAssoc_BindConnection receive failed with error 1726", "Failed to open service
+ * control manager"), the service was never registered, and every game that needs Steam's CEG step
+ * stopped with Dock code 49.
+ *
+ * So the APC stays on the busy thread when nobody else can take it. The thread runs it at its next
+ * wait in the server: check_wait returns STATUS_KERNEL_APC for any interruptible wait, and a
+ * fastsync wait parks in process for at most MADEIRA_FASTSYNC_CAP_US (2 ms) before it falls through
+ * to the server. It is not done when the process has the in-process engine (madsync:
+ * thread->alert_sync exists), where a wait can sit outside the server without a bound and a system
+ * APC does not interrupt it (the services.exe case described above). Only the drop changes, which
+ * ended the I/O with no data: a waiting thread, or a synchronous request's issuer, still takes the
+ * APC first. On by default; MADEIRA_APC_BUSY_QUEUE=0 drops the APC as before. [apc-requeue] says
+ * "kept on the busy thread" for these. */
 static int ios_apc_busy_queue_enabled( void )
 {
     static int enabled = -1;
@@ -1824,16 +1831,15 @@ static int ios_apc_busy_queue_enabled( void )
     if (enabled < 0)
     {
         const char *e = getenv( "MADEIRA_APC_BUSY_QUEUE" );
-        enabled = e && e[0] == '1';
-        if (enabled)
-            fprintf( stderr, "[apc-requeue] MADEIRA_APC_BUSY_QUEUE=1: an async I/O APC nobody else can take "
-                     "stays on its busy thread (no in-process engine)\n" );
+        enabled = !(e && e[0] == '0');
+        fprintf( stderr, "[apc-requeue] busy queue %s (MADEIRA_APC_BUSY_QUEUE=0 drops an async I/O APC "
+                 "no other thread can take; never with the in-process engine)\n", enabled ? "on" : "off" );
     }
     return enabled;
 }
 
-/* A waiting thread, the synchronous request's future waiter, the busy thread itself
- * (MADEIRA_APC_BUSY_QUEUE=1), or NULL to drop. */
+/* A waiting thread, the synchronous request's future waiter, the busy thread itself (unless
+ * MADEIRA_APC_BUSY_QUEUE=0), or NULL to drop. */
 static struct thread *ios_apc_requeue_target( struct thread *thread, const struct thread_apc *apc )
 {
     static unsigned int count;

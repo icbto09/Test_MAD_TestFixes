@@ -74,18 +74,18 @@ MERGED = {'msfs-2024', 'counter-strike-2', 'breakneck', 'spelunky-2', 'albion-on
           'batman-arkham-city-goty', 'trails-in-the-sky-1st-chapter', 'subnautica-2', 'rdr1-steam', 'resident-evil-requiem', 'resident-evil-requiem-demo',
           'life-is-strange-remastered', 'life-is-strange-2', 'project-zomboid', 'spiderheck', 'rounds', 'plateup',
           'final-fantasy-tactics-ivalice-chronicles', 'jetboard-joust', 'dead-as-disco', 'tung', 'sekiro-shadows-die-twice', 'stardew-valley',
-          'glyphica-typing-survival', 'the-adventures-of-elliot', 'the-escapists-2', 'garrys-mod', 'persona-3-reload', 'grounded', 'innerspace'}
+          'glyphica-typing-survival', 'the-adventures-of-elliot', 'the-escapists-2', 'garrys-mod', 'persona-3-reload', 'grounded', 'innerspace', 'satisfactory-steam'}
 assert set(presets) == {'rdr2-steam', 'rdr2-other', 'gta5e-steam', 'gta5e-other', 'gta5l-steam', 'gta5l-other', 'gta4-steam',
                         'ghost-of-tsushima', 'god-of-war', 'horizon-zero-dawn', 'horizon-forbidden-west', 'ratchet-clank-rift-apart',
                         'crysis-remastered', 'crysis-2-remastered', 'crysis-3-remastered', 'rockstar-launcher', 'rockstar-launcher-setup',
                         'battle-net', 'battle-net-setup', 'steam-big-picture', 'dark-souls-remastered', 'dark-souls-iii', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2',
-                        'standard', 'avicii-invector'} | MERGED, \
+                        'standard', 'melonloader', 'avicii-invector'} | MERGED, \
     sorted(presets)
 assert ('static let all = [rdr2Steam, rdr2Other, gta5EnhancedSteam, gta5EnhancedOther, gta5LegacySteam, gta5LegacyOther, gta4Steam,\n'
         '                      ghostOfTsushima, godOfWar, horizonZeroDawn, horizonForbiddenWest, ratchetClankRiftApart, crysisRemastered,\n'
         '                      crysis2Remastered, crysis3Remastered, rockstarLauncher, rockstarLauncherSetup, battleNet, battleNetSetup,\n'
         '                      steamBigPicture,\n'
-        '                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, blackOps1, blackOps2, borderlands2, standard]\n'
+        '                      darkSoulsRemastered, darkSoulsIII, falloutNewVegas, fallout3, blackOps1, blackOps2, borderlands2, standard, melonLoader]\n'
         '        + steamTitles.map(\\.list)') in lists_src
 # The Rockstar Games Launcher outside Steam (logs 91-93, 2026-10-28): Launcher.exe in its own folder gets the
 # launcher chain's lines, its installer the standard line; both start in the Wine desktop with Windows services.
@@ -164,15 +164,13 @@ assert 'MadeiraConfig.flag("MADEIRA_BIG_PICTURE_PIN", fallback: true)' in librar
     and 'fm.fileExists(atPath: "\\(folder.unix)/bin/cef/cef.win7/steamwebhelper.exe")' in library \
     and '(pinned ? " -nobootstrapperupdate -skipinitialbootstrap" : "")' in library
 # Big Picture is compiled out of every build without the MADEIRA_BIG_PICTURE_UI condition (no IPA build sets it).
-bp_button = library[library.index('#if MADEIRA_BIG_PICTURE_UI\n            if LibraryEntry.steamClientInstalled {'):]
-bp_button = bp_button[:bp_button.index('#endif')]
-assert 'Label("Big Picture", systemImage: "gamecontroller")' in bp_button and '.id(LibraryEntry.bigPictureID)' in bp_button, \
-    'the Big Picture button exists only under MADEIRA_BIG_PICTURE_UI'
-assert library.count('Label("Big Picture", systemImage: "gamecontroller")') == bp_button.count('Label("Big Picture", systemImage: "gamecontroller")'), \
-    'no Big Picture button outside that block'
+# One UI (Nov 10): the Big Picture button lived on the old library's toolbar, inside the condition, and
+# went with it; nothing in the app offers Big Picture now. Its launch code is still compiled.
+assert 'Label("Big Picture"' not in library and 'Label("Big Picture"' not in (app / 'NewLook.swift').read_text(), \
+    'no Big Picture button in the app'
 assert '#if MADEIRA_BIG_PICTURE_UI\n    static let bigPictureShown = true\n#else\n    static let bigPictureShown = false\n#endif' in library \
     and 'MADEIRA_BIG_PICTURE"' not in library \
-    and library.count('$0.desktop != true && $0.listedInLibrary') == 2 and 'entry.desktop != true && entry.listedInLibrary' in library, \
+    and 'entry.desktop != true && entry.listedInLibrary' in (app / 'NewLook.swift').read_text(), \
     'without MADEIRA_BIG_PICTURE_UI no Big Picture card is listed, and no runtime switch brings it back'
 
 # madeira-bcd's defaults where upstream's differ: every game madeira-bcd ran had them,
@@ -187,7 +185,8 @@ for ident, p in presets.items():
         p['tested'], p['fork'] = [line for line in p['lines'][2:] if not line.startswith('#')], []
         continue
     # These lists were tested without madeira-bcd's defaults.
-    if ident in ('standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector'):
+    if ident in ('standard', 'fallout-new-vegas', 'fallout-3', 'black-ops-1', 'black-ops-2', 'borderlands-2', 'persona-3-reload', 'avicii-invector',
+                  'satisfactory-steam', 'melonloader'):
         assert not set(FORK_DEFAULTS) & set(p['lines']), (ident, "the standard list has none of madeira-bcd's defaults")
         p['tested'], p['fork'] = p['lines'][2:], []
         continue
@@ -559,7 +558,9 @@ assert 'case "gta5.exe":\n            // GTA V Legacy\'s game program, inside or
        '            return inSteam ? gta5LegacySteam : gta5LegacyOther' in match
 # The merged Steam titles: by App ID or folder after the lists above, by program in the switch's default.
 assert 'return steamTitles.first { title in\n' in match
-assert 'default:\n            return steamTitles.first { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) }?.list' in match
+assert 'default:\n            if let list = steamTitles.first(where: { $0.programs.contains(last) || (inSteam && $0.steamPrograms.contains(last)) })?.list {\n                return list\n            }' in match
+# [melonloader] a MelonLoader game with no list of its own: version.dll and the MelonLoader folder beside the program.
+assert 'fileExists(folder + "\\\\version.dll"), fileExists(folder + "\\\\MelonLoader") {\n                return melonLoader\n            }\n            return nil\n' in match
 # GTA V Legacy (Steam) v1 (community build 547): DirectX 11, so no D3D12 lines and no DualSense mode; no vram-mb or
 # swap-mb in the list; a device under 12 GB of RAM gets the 3 GB RAM swap after it.
 legacy = presets['gta5l-steam']
@@ -609,7 +610,8 @@ assert 'Button("Reset to Recommended"' not in detail[detail.index('    var body:
 # shown with the page's other sections since the Game details pages).
 assert detail.index('Button("Remove from library"') < detail.index('Button("Reset to Recommended"')
 assert 'if let error { Section' in detail
-assert '!remove, !confirmReset else { return }' in detail
+# One UI (Nov 10): B on the game's page (lookBack) does nothing while the Reset question is up.
+assert '!remove, !confirmReset, !confirmSteamUninstall else { return }' in library
 launch = block(content, '    private func launchLibraryEntry(_ entry: LibraryEntry) {', '\n    }\n')
 assert launch.index('if GameRecommendations.prepare(&entry, new: isNew) { library.save(entry) }') < launch.index('BCDLaunch.applyLibrary(entry)')
 for name in ('GameRecommendations.swift', 'GameRecommendationsApply.swift'):
@@ -762,6 +764,8 @@ check(id(#"C:\Games\GTA IV\GTAIV.exe"#) == "none", "GTA IV outside Steam has no 
 // The device's RAM: GTA V Legacy's 3 GB RAM swap only under 12 GB; every other list the same everywhere.
 R.deviceRAMBytes = 11_695 << 20
 let onTwelve = R.all.map { $0.fileText }
+check(!R.satisfactorySteam.fileText.contains("swap-mb") && R.satisfactorySteam.fileText.hasSuffix("rp-discard = 1\n"),
+      "a 12 GB phone: Satisfactory (Steam) is the tested Epic list alone")
 check(!R.gta5LegacySteam.fileText.contains("swap-mb") && !R.gta5LegacySteam.fileText.contains("vram-mb"),
       "a 12 GB phone: no RAM swap in GTA V Legacy's list")
 R.deviceRAMBytes = 16 << 30
@@ -771,6 +775,8 @@ check(R.gta5LegacySteam.fileText.hasSuffix("env.MADEIRA_JIT_DUMP = 0\nswap-mb = 
       "an 8 GB phone: the 3 GB RAM swap after GTA V Legacy's list")
 check(R.gta5LegacyOther.fileText.hasSuffix("env.MADEIRA_JIT_DUMP = 0\nswap-mb = 3072\n"),
       "an 8 GB phone: the 3 GB RAM swap after GTA V Legacy's list outside Steam too")
+check(R.satisfactorySteam.fileText.hasSuffix("rp-discard = 1\nswap-mb = 8192\nswap-mode = 2\nswap-images = 1\nvram-mb = 768\nenv.MADEIRA_SWAP_MIN_KB = 64\n"),
+      "a 6-8 GB device: the swap file and 768 MB of video memory after Satisfactory (Steam)'s list")
 check(zip(R.all, onTwelve).allSatisfy { $0.0.smallRAMConfig != nil || $0.0.fileText == $0.1 },
       "every list without small-device lines is the same on an 8 GB phone")
 R.deviceRAMBytes = 11_695 << 20
@@ -844,7 +850,20 @@ check(id(steam + #"\AVICII"#, 986800) == "avicii-invector"
       && id(#"C:\Games\AVICII Invector.exe"#) == "avicii-invector", "AVICII Invector by App ID, folder and program")
 check(id(#"C:\Games\Avicii - Invector\UnityCrashHandler64.exe"#) == "none", "do not match the Unity redistributable")
 check(id(#"C:\Program Files\Epic Games\InnerSpace\InnerSpace.exe"#) == "innerspace", "InnerSpace (Epic) by its program")
-check(R.steamTitles.count == 55 && R.all.count == 83, "55 titles in the Steam table, 83 lists")
+check(id(steam + #"\Satisfactory"#, 526870) == "satisfactory-steam" && id(steam + #"\Satisfactory"#) == "satisfactory-steam"
+      && id(#"C:\Program Files\Epic Games\Satisfactory\FactoryGameEGS.exe"#) == "none", "Satisfactory (Steam) by App ID and folder, not the Epic copy")
+let pvz = #"C:\PvZ.Fusion\Game Files"#
+check(id(pvz + #"\PlantsVsZombiesRH.exe"#, files: [pvz + #"\version.dll"#, pvz + #"\MelonLoader"#]) == "melonloader",
+      "a MelonLoader game: version.dll and the MelonLoader folder beside the program")
+check(id(pvz + #"\PlantsVsZombiesRH.exe"#, files: [pvz + #"\MelonLoader"#]) == "none"
+      && id(pvz + #"\PlantsVsZombiesRH.exe"#, files: [pvz + #"\version.dll"#]) == "none", "MelonLoader needs both")
+check(id(pvz + #"\UnityCrashHandler64.exe"#, files: [pvz + #"\version.dll"#, pvz + #"\MelonLoader"#]) == "none",
+      "not Unity's crash handler beside a MelonLoader game")
+check(id(#"C:\Program Files\Epic Games\InnerSpace\InnerSpace.exe"#,
+         files: [#"C:\Program Files\Epic Games\InnerSpace\version.dll"#, #"C:\Program Files\Epic Games\InnerSpace\MelonLoader"#]) == "innerspace",
+      "a game's own list wins over the MelonLoader list")
+check(R.melonLoader.fileText.contains("\noversize-reserve = 1\n"), "the MelonLoader list serves large reservations in part")
+check(R.steamTitles.count == 56 && R.all.count == 85, "56 titles in the Steam table, 85 lists")
 check(id(#"C:\Games\Foo\foo.exe"#) == "none" && id(steam + #"\Portal 2"#, 620) == "none", "other games")
 check(id("") == "none" && id("C:\\") == "none", "no path")
 print("PASS: Steam games by App ID or steamapps\\common folder, GTA V Enhanced and RDR2 inside and outside Steam, GoT, GoW, the Horizon games, Rift Apart and the three Crysis Remastered games by their programs, GTA V Legacy outside Steam, the 51 merged Steam titles, others none")

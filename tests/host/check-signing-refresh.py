@@ -250,11 +250,13 @@ require('SigningRefresh.swift in Sources' in project and project.count('/* Signi
         'the Xcode project compiles SigningRefresh.swift into the app')
 require('AppleSignIn.swift in Sources' in project and project.count('/* AppleSignIn.swift */') == 3,
         'the Xcode project compiles AppleSignIn.swift into the app')
-require('SigningSettingsSection()' in library and '.modifier(SigningRefreshOffer())' in library,
+# One UI (Nov 10): the long Settings page is gone; Signing is its own Settings page, shown by the switch.
+settings_pages = (app / 'SettingsPages.swift').read_text()
+require('case .signing: SigningSettingsSection()' in settings_pages and '.modifier(SigningRefreshOffer())' in library,
         'the library shows the Signing section, refreshes and offers')
 app_entry = (app / 'MadeiraApp.swift').read_text()
 require('nonisolated static var enabled: Bool { MadeiraConfig.flag("MADEIRA_SIGNING_REFRESH", fallback: false) }' in signing
-        and 'if SigningRefresh.enabled, settingsShow("signing"' in library
+        and 'case .signing: return SigningRefresh.enabled' in settings_pages
         and 'if SigningRefresh.enabled { SigningAccountStore.takeIn() }' in app_entry
         and offer.count('if SigningRefresh.enabled { signing.libraryAppeared() }') == 2
         and block(signing, 'func libraryAppeared()').count('SigningAccountStore.takeIn()') <= 1,

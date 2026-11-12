@@ -1,0 +1,106 @@
+Windows: skip FEX's own code flushes under the code invalidation lock
+
+On the iOS host FEX flushes its own translated code through
+NtFlushInstructionCache (JIT.cpp IOSFlushOneInstr, Arm64.cpp ClearICache),
+and wine's ARM64EC NtFlushInstructionCache passes every flush back to
+BTCpu64FlushInstructionCache, which takes ThreadCreationMutex. A block
+delinker does that from LookupCache::InvalidateRange, so the thread waits
+for ThreadCreationMutex while write-owning CodeInvalidationMutex. The
+write-fault path (ResetToConsistentStateImpl) takes them the other way
+round, ThreadCreationMutex first, so two threads can wait on each other
+forever.
+
+Seen on PvZ Fusion with MelonLoader (Test 8 Get Help logs, Nov 10 2026),
+both runs: "RtlpWaitForCriticalSection section ...848 blocked by" on
+ThreadCreationMutex (xtajit64.dll+0x42c848) against "[fexlock] STUCK" on
+CodeInvalidationMutex taken at LockCodeInvalidationUnlessHeld+0xa8, then
+every guest thread idle and a black screen.
+
+BTCpu64FlushInstructionCache and FlushInstructionCacheHeavy now return at
+once when the calling thread write-owns CodeInvalidationMutex or has a
+shared emission hold: such a flush names FEX's own code buffer, and guest
+code never runs under those locks. Nothing is logged there (the allocator
+may be mid-operation); skips are counted. Off: MADEIRA_FLUSH_OWN_LOCK=0.
+
+Applies on FEX a77d5687 after 0001 and 0002. Madeira-only: not for
+FEX-Emu.
+
+diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
+--- a/Source/Windows/ARM64EC/Module.cpp
++++ b/Source/Windows/ARM64EC/Module.cpp
+@@ -2166,25 +2166,75 @@
+     }
+   } else {
+     ThreadCreationMutex.unlock();
+   }
+ }
+ 
++/* MADEIRA [flush-own-lock]: a flush FEX itself issued while holding the code invalidation lock.
++ *
++ * On iOS, FEX's JIT flushes its own code through NtFlushInstructionCache (JIT.cpp IOSFlushOneInstr,
++ * Arm64.cpp ClearICache), and wine's EC wrapper of that call comes back here. A block delinker does
++ * it from LookupCache::InvalidateRange, i.e. with CodeInvalidationMutex WRITE-owned, and then waited
++ * here for ThreadCreationMutex. Every other path takes ThreadCreationMutex first and
++ * CodeInvalidationMutex second (ResetToConsistentStateImpl's write-fault path), so the two threads
++ * waited on each other forever: PvZ Fusion with MelonLoader (Test 8, Get Help logs, Nov 10) froze
++ * 24 s and 100 s in, both times "RtlpWaitForCriticalSection ... blocked by" on this mutex
++ * (xtajit64.dll+0x42c848) against a "[fexlock] STUCK" on CodeInvalidationMutex taken at
++ * LockCodeInvalidationUnlessHeld. Such a flush names FEX's own code buffer, never guest code, so
++ * there is nothing to invalidate: return without taking either lock. (Invalidating anyway would be
++ * worse: the delinker runs inside InvalidateCodeBuffersCodeRange, which holds CodeBufferListLock and
++ * the lookup cache's write lock, neither of them recursive.) The same holds for a thread with only a
++ * shared emission hold (a compile's own flush): taking ThreadCreationMutex there closes the same loop.
++ * Guest flushes never arrive with these locks held: guest code does not run under them.
++ * Off: env.MADEIRA_FLUSH_OWN_LOCK = 0 (upstream behaviour). */
++static bool IosFlushOwnLockAllowed() {
++  static const bool Allowed = [] {
++    const char* V = getenv("MADEIRA_FLUSH_OWN_LOCK");
++    return !(V && V[0] == '0' && V[1] == 0);
++  }();
++  return Allowed;
++}
++
++// Flushes skipped by IosFlushUnderOwnLock (for a debugger or a later report).
++static std::atomic<uint64_t> IosFlushOwnLockSkips {0};
++
++// True when the flush was handled here (the caller returns).
++static bool IosFlushUnderOwnLock() {
++  if (!IosFlushOwnLockAllowed() || !CTX) {
++    return false;
++  }
++  const bool Exclusive = CTX->GetCodeInvalidationMutex().IosHeldExclusiveByThisThread();
++  const bool Shared = !Exclusive && FEXCore::Utils::WritePriorityMutex::IosEmissionLocksHeldBySelf();
++  if (!Exclusive && !Shared) {
++    return false;
++  }
++  // No log line here: it would allocate with CodeBufferListLock and the lookup cache's write lock
++  // held, and an allocation can come back through the memory notifications. Count only.
++  IosFlushOwnLockSkips.fetch_add(1, std::memory_order_relaxed);
++  return true;
++}
++
+ void FlushInstructionCacheHeavy(const void* Address, SIZE_T Size) {
+   if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
+     return;
+   }
++  if (IosFlushUnderOwnLock()) {
++    return;
++  }
+ 
+   std::scoped_lock Lock(ThreadCreationMutex);
+   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+ }
+ 
+ void BTCpu64FlushInstructionCache(const void* Address, SIZE_T Size) {
+   if (!InvalidationTracker || ProcessTerminating.load(std::memory_order_relaxed) || !GetCPUArea().ThreadState()) {
+     return;
+   }
++  if (IosFlushUnderOwnLock()) {
++    return;
++  }
+ 
+   std::scoped_lock Lock(ThreadCreationMutex);
+   InvalidationTracker->InvalidateAlignedInterval(reinterpret_cast<uint64_t>(Address), static_cast<uint64_t>(Size), false);
+ }
+ 
+ void BTCpu64NotifyMemoryDirty(void* Address, SIZE_T Size) {

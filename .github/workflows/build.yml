@@ -35,6 +35,7 @@ jobs:
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
           xcodebuild -version
+
       - uses: actions/checkout@v4
       - name: Check build reuse rules
         run: |
@@ -78,6 +79,7 @@ jobs:
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
           xcodebuild -version
+
       - uses: actions/checkout@v4
       - id: sdk
         run: bash tools/build/ci-input-key.sh
@@ -116,6 +118,7 @@ jobs:
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
           xcodebuild -version
+
       - uses: actions/checkout@v4
       - id: sdk
         run: bash tools/build/ci-input-key.sh
@@ -167,6 +170,7 @@ jobs:
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
           xcodebuild -version
+
       - uses: actions/checkout@v4
       - id: sdk
         run: bash tools/build/ci-input-key.sh
@@ -183,7 +187,7 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           brew install ninja || true
-          # Madeira_Test8: FEX, wine, dxmt and madeira-dock are ordinary folders here, not submodules.
+          # Madeira_Test12: wine, dxmt and FEX are ordinary folders here, not submodules.
           tools/build/build-fex-ios.sh
       - name: Retain FEX outputs for this run
         continue-on-error: true
@@ -216,6 +220,7 @@ jobs:
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
           xcodebuild -version
+
       - uses: actions/checkout@v4
       - id: sdk
         run: bash tools/build/ci-input-key.sh
@@ -236,7 +241,8 @@ jobs:
         run: |
           brew install meson ninja bison || true
           export PATH="$(brew --prefix bison)/bin:$PATH"
-          # Madeira_Test8: wine and dxmt are ordinary folders here, not submodules.
+          # Madeira_Test12: wine, dxmt and FEX are ordinary folders here, not submodules.
+          # Madeira_Test12: wine, dxmt and FEX are ordinary folders here, not submodules.
           tools/build/setup-llvm-mingw.sh
           # DXMT's i386 build compiles Metal shaders: it needs the Metal toolchain
           # and the Xcode 27 atomic fix that build-shader-headers.sh applies.
@@ -278,6 +284,7 @@ jobs:
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
           xcodebuild -version
+
       - uses: actions/checkout@v4
       - id: sdk
         run: bash tools/build/ci-input-key.sh
@@ -329,7 +336,10 @@ jobs:
           NEWEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$NEWEST" ]; then sudo xcode-select -s "$NEWEST/Contents/Developer"; fi
           xcodebuild -version
+
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - id: sdk
         run: bash tools/build/ci-input-key.sh
       - id: cache-llvm

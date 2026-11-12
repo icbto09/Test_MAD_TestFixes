@@ -6907,6 +6907,16 @@ static inline void mad_rs_step(int b, UINT64 *t0) {
     InterlockedIncrement(&g_rs_n[b]);
     *t0 = t1;
 }
+/* Indirect draw split (diagnostic, with replay-split): where one indirect draw's
+ * CPU time goes in exec_draw. Phases: 0 render pass open, 1 argument tables,
+ * 2 other state, 3 residency + encode. Draws that return early are not counted. */
+static volatile LONG64 g_ids_t[4]; static volatile LONG g_ids_n;
+static void mad_ids_report(double np, double tf) {
+    LONG n = InterlockedExchange(&g_ids_n, 0); int k; double ms[4];
+    for (k = 0; k < 4; k++) ms[k] = 1000.0 * (double)InterlockedExchange64(&g_ids_t[k], 0) / tf / np;
+    if (n) d3d12_log("[perf] indirect draw split per frame (%.0f draws): pass open %.2f ms, tables %.2f ms, state %.2f ms, residency+encode %.2f ms\n",
+                     n / np, ms[0], ms[1], ms[2], ms[3]);
+}
 static void mad_rs_report(double presents) {
     char buf[640];
     double tf = (double)mad_tick_freq(), np = presents > 0 ? presents : 1.0;
@@ -6920,6 +6930,7 @@ static void mad_rs_report(double presents) {
         pos += snprintf(buf + pos, sizeof buf - pos, " %s %.2f ms (%.0f)", g_rs_names[b], 1000.0 * (double)t / tf / np, n / np);
     }
     d3d12_log("%s\n", buf);
+    mad_ids_report(np, tf);
 }
 
 /* ---- madeira-bcd skin-check (diagnostic, opt-in) ------------------------------
@@ -8544,6 +8555,8 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
     struct wmtcmd_render_setbuffer sb[6 + 16 + 2];
     struct wmtcmd_render_setbufferoffset so[6 + 16 + 2];   /* madeira-bcd draw-dedup: sb[k] as an offset-only set */
     struct mad_dd *dd = NULL;                              /* madeira-bcd draw-dedup: what the encoder holds; NULL = send everything */
+    const int ids_on = g_replay_split > 0 && (c->kind == MC_DRAW_INDIRECT || c->kind == MC_DRAW_INDEXED_INDIRECT);   /* indirect draw split */
+    UINT64 ids_t0 = ids_on ? mad_tick() : 0, ids_p[4] = {0, 0, 0, 0};
     struct wmtcmd_render_useresource ur[256];
     struct wmtcmd_render_setdsso c_dss;
     struct wmtcmd_render_setrasterizerstate c_ras;
@@ -8613,6 +8626,7 @@ static void exec_draw(struct mad_exec *e, const struct mad_cmd *c) {
         exec_end(e);
     }
     if (!exec_begin_render(e)) { MAD_SKIP(e); return; }
+    if (ids_on) { UINT64 t = mad_tick(); ids_p[0] = t - ids_t0; ids_t0 = t; }
     if (g_skip_ps_state && mad_skip_ps_match(e->pso)) { MAD_SKIP(e); return; }   /* madeira-bcd: diagnostic, off unless skip-ps is set */
     g_dump_tables = 0;
     if (g_capture_on && g_capture_ps[0] && mad_name_in_list(g_capture_ps, e->pso->ps_name) && g_capture_ps_shots < 8) {   /* ml1106; ml1152: any listed ps, 8 shots; madeira-bcd: exact names (a substring match let ps_SetColor eat the shots meant for ps_SetColor_MultiLight) */
@@ -8780,6 +8794,7 @@ tess_go:
         MAD_SETBUF(WMTRenderCommandSetFragmentBuffer, e->smp->buffer, 0, 1);
     }
     }
+    if (ids_on) { UINT64 t = mad_tick(); ids_p[1] = t - ids_t0; ids_t0 = t; }
     /* Vertex buffers ride at kIRVertexBufferBindPoint (6) + slot -- for the
      * DXIL (MSC) backend only. ml1105: the DXBC backend pulls vertices through
      * its table at Metal index 16, and this loop bound D3D slot 10 at 6 + 10 =
@@ -9081,6 +9096,7 @@ tess_go:
      * buffer retains what it is given, so a release after the encode is safe.
      * Read here, after every early return above, so the lock is never left held. */
     int ml1302_held = 0;
+    if (ids_on) { UINT64 t = mad_tick(); ids_p[2] = t - ids_t0; ids_t0 = t; }
     if (!ml1060_skip_lists) {
         struct wmtcmd_base *dl_head = NULL, *dl_tail = NULL;
 #define MAD_USE_DL(h, u) do { if ((h) && nur < 256 && !mad_use_seen(e, e->renc, (h), (UINT32)(u), use_stages)) { \
@@ -9132,6 +9148,11 @@ tess_go:
     if (c_pso.type == WMTRenderCommandSetPSO && !tv && c_pso.pso != e->pso->rps) mad_eb_flush_cur(EBF_VARIANT);
     if (ml1302_held) { mad_eb_flush_cur(EBF_OTHER); ReleaseSRWLockShared(&dev->list_lock); }   /* ml1302: the batch is encoded */
     mad_use_commit(e);   /* this draw's useResource entries reached the encoder */
+    if (ids_on) {
+        int k; ids_p[3] = mad_tick() - ids_t0;
+        for (k = 0; k < 4; k++) InterlockedExchangeAdd64(&g_ids_t[k], (LONG64)ids_p[k]);
+        InterlockedIncrement(&g_ids_n);
+    }
 #undef MAD_APPEND
     e->draws++; e->pass_draws++;   /* ml1098 */
     if (e->nrt && e->rt[0] && e->rtp[0].layers > 1) {   /* ml926: layered draws */

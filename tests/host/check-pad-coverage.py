@@ -6,7 +6,7 @@ have something to land on or an A of its own.
     python3 tests/host/check-pad-coverage.py          # report
     python3 tests/host/check-pad-coverage.py --strict # exit 1 on anything uncovered
 
-A control counts as covered when a .padItem( or .menuPad( (or a padItem-registering style)
+A control counts as covered when a .padItem( (or a padItem-registering style)
 follows it before the next control starts at the same or a shallower indent. Rough by design:
 it points at places to look, it does not prove a screen works.
 """
@@ -30,7 +30,7 @@ screens = {
 }
 
 control = re.compile(r'^\s*(Button\b|Toggle\b|Picker\b|Slider\b|Stepper\b|NavigationLink\b|TextField\b|Menu\b)')
-covered_by = ('.padItem(', '.menuPad(', 'PadCardStyle', '.padLayer(', 'pageRow(')
+covered_by = ('.padItem(', 'PadCardStyle', '.padLayer(')
 skip_words = ('contextMenu', 'confirmationDialog', '.toolbar', 'alert(')
 
 def indent(s):
@@ -77,7 +77,7 @@ for name in ['NewLook.swift', 'Library.swift']:
 # Every layer: a start item, or items under it, or an accept of its own.
 print()
 layer_re = re.compile(r'\.padLayer\("([^"]+)"(.*)')
-for name in ['NewLook.swift', 'Library.swift', 'MenuPad.swift', 'SettingsPages.swift']:
+for name in ['NewLook.swift', 'Library.swift', 'PadHighlight.swift', 'SettingsPages.swift']:
     for n, line in enumerate((app / name).read_text(encoding='utf-8').splitlines(), 1):
         m = layer_re.search(line)
         if m:
